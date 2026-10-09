@@ -1,0 +1,25 @@
+[server]
+# Streamlit Cloud 会用 8501 端口
+port = 8501
+headless = true
+runOnSave = false
+fileWatcherType = "none"
+# 关闭 CORS 限制,允许任何来源访问
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+# 默认主题配色
+primaryColor = "#FF6B6B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"
+font = "sans serif"
+
+[client]
+# 移动端友好:工具栏、错误提示默认显示
+toolbarMode = "minimal"
+showErrorDetails = true

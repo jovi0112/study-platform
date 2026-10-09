@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# 本地数据(每个用户自己的数据,不上传仓库)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+uploads/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# 编辑器
+.idea/
+.vscode/
+*.iml
+
+# OCR 模型(首次运行时自动下载)
+.rapidocr/
+
+# 打包文件
+*.zip
+
+# 测试/临时
+test_*.py
+_t*.bat
+*.log
+*.tmp
