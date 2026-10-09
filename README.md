@@ -115,6 +115,34 @@ App 跑起来后, 你的 App 页面右上 ⋯ → Settings → Secrets, 粘贴�
 - 但 app 闲置 7 天无访问会进入休眠, 重新访问会冷启动(慢 10-30 秒)
 - **重要数据建议每周导出一次** (家长端 → 数据导出 CSV)
 
+## 🩺 常见排错
+
+### 云端 OCR 报错 `libGL.so.1: cannot open shared object file`
+
+**原因**: Streamlit Cloud 跑在 Linux 上, `rapidocr` 依赖的 opencv 需要系统库 `libGL.so.1`, 云端基础镜像不带。
+
+**修复**: 仓库根目录必须存在 `packages.txt` (已包含):
+```
+libgl1
+libglib2.0-0
+libgomp1
+libsm6
+libxext6
+libxrender1
+```
+Streamlit Cloud 会在构建时自动 `apt-get install` 这些包。改完推送到 GitHub 后:
+- App 一般会**自动重新部署**(1-3 分钟)
+- 没动静就手动触发: App 页面右上 `⋮` → **Reboot**
+
+### 侧边栏一直显示 `AI 老师: 离线 (offline)`
+
+这是**正常默认状态**, 不是报错 —— 表示还没配 LLM API。按上面「启用 AI 老师 → Secrets」配好即可。
+> 注意: 配完 Secrets 后必须 **Reboot** 应用, 因为配置在模块导入时读取。
+
+### 本地 `.bat` 双击闪退 / 提示"不是内部或外部命令"
+
+含中文的 `.bat` 必须存为 **GBK/ANSI** 编码。用 UTF-8 会让 cmd 解析失败。脚本里已加 `chcp 936`。
+
 ## 文件结构
 
 ```
@@ -124,7 +152,9 @@ study-platform/
 ├── ocr.py              # RapidOCR 封装
 ├── llm.py              # LLM 抽象层
 ├── web_search.py       # 联网搜题
-├── requirements.txt
+├── requirements.txt    # pip 依赖
+├── packages.txt        # 云端 apt 系统依赖 (必须, 修 libGL)
+├── .streamlit/         # 云端主题/端口配置
 ├── install.bat         # 首次装依赖 (Windows)
 ├── open_firewall.bat   # 放行 8501 端口 (需管理员)
 ├── start.bat           # 一键启动 (Windows)
