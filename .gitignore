@@ -21,6 +21,12 @@ data/*.db-wal
 data/*.db-shm
 uploads/
 
+# 本地密钥(API Key 等),绝不上传
+.streamlit/secrets.toml
+secrets.toml
+.env
+.env.*
+
 # 系统
 .DS_Store
 Thumbs.db
