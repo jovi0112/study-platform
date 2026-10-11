@@ -58,6 +58,195 @@ def tag_pill(text: str, color: str = '#1f77b4'):
     return f'<span style="background:{color};color:white;padding:2px 8px;border-radius:8px;font-size:12px">{text}</span>'
 
 
+# ============== AI 讲题标签 (L2 提问 / L3 审问 / L4 共创) ==============
+FOLLOWUP_LIBRARY = {
+    'more': '🔍 再讲细一点',
+    'alt': '🔁 换个方法',
+    'similar': '📝 出 3 道同类型变式',
+    'error': '🖊️ 红笔批改(我填了答案, 请找茬)',
+    'teachback': '🎤 我讲给你听(我复述一遍, 请评分)',
+}
+
+
+def _render_ai_tab(m):
+    """讲题标签: 默认 hint(只讲思路) → 看答案(full) → 4 类追问 → 我的好提示词"""
+    mid = m['id']
+    sid_hint = f'ai_step_{mid}'
+    sid_hist = f'ai_history_{mid}'
+    sid_kid_ans = f'ai_kid_ans_{mid}'
+    sid_kid_tb = f'ai_kid_tb_{mid}'
+    sid_last_save = f'ai_last_save_{mid}'
+
+    # 初始化 session_state
+    st.session_state.setdefault(sid_hint, None)         # None | 'hint' | 'full'
+    st.session_state.setdefault(sid_hist, [])            # [{role, text, source}, ...]
+    st.session_state.setdefault(sid_kid_ans, '')
+    st.session_state.setdefault(sid_kid_tb, '')
+    st.session_state.setdefault(sid_last_save, None)
+
+    # 步骤指示
+    step = st.session_state[sid_hint]
+    if step is None:
+        st.caption('点击下方按钮开始 AI 讲题')
+    else:
+        st.caption('①思路 → ②看答案 → ③追问 → ④我的好提示词')
+
+    # ====== 按钮 1: 触发讲题(hint 模式) ======
+    if st.button('🤖 让我先想想，给我点思路', key=f'ai_hint_{mid}',
+                 type='primary', use_container_width=True):
+        if step is None:
+            with st.spinner('AI 在想思路(只讲思路, 不给答案)…'):
+                res = llm.solve(m['question'], m['subject'], mode='hint')
+            st.session_state[sid_hist] = [{'role': 'hint', 'text': res.get('explanation', ''),
+                                          'source': res.get('source', '')}]
+            st.session_state[sid_hint] = 'hint'
+            st.rerun()
+
+    # ====== 历史对话渲染 ======
+    for i, turn in enumerate(st.session_state[sid_hist]):
+        role = turn['role']
+        text = turn.get('text', '')
+        if role == 'hint':
+            st.info('💡 **思路提示**(没有最终答案, 让你自己想)\n\n' + (text or '(空)'))
+        elif role == 'full':
+            st.success('✅ **答案**\n\n' + (text or '(空)'))
+        elif role in FOLLOWUP_LIBRARY:
+            label = FOLLOWUP_LIBRARY[role]
+            with st.expander(f"{label} · 展开", expanded=True):
+                st.write(text or '(空)')
+                # "保存为我的好提示词"按钮
+                save_key = f'save_prompt_{mid}_{i}'
+                if st.button(f'⭐ 把这次追问存为"我的好提示词"', key=save_key):
+                    short = FOLLOWUP_LIBRARY[role].split(' ', 1)[1] if ' ' in FOLLOWUP_LIBRARY[role] else FOLLOWUP_LIBRARY[role]
+                    saved = db.append_good_prompt(mid, short)
+                    if saved:
+                        st.session_state[sid_last_save] = short
+                        st.success(f'已收藏: {short}')
+                    else:
+                        st.info('这条已经收藏过啦')
+                    time.sleep(0.3)
+                    st.rerun()
+
+    # ====== 按钮 2: 看答案(full 模式) ======
+    if step == 'hint':
+        st.divider()
+        if st.button('👀 我想好啦, 看答案', key=f'ai_full_{mid}', use_container_width=True):
+            with st.spinner('正在生成完整答案…'):
+                res = llm.solve(m['question'], m['subject'], mode='full')
+            # 不清空历史, 在末尾追加
+            st.session_state[sid_hist].append({
+                'role': 'full',
+                'text': res.get('answer', '') or '(暂无)',
+                'source': res.get('source', '')
+            })
+            st.session_state[sid_hint] = 'full'
+            st.rerun()
+
+    # ====== 追问区 (4 个按钮 + 1 个我讲给你听) ======
+    if step in ('hint', 'full'):
+        st.divider()
+        st.markdown('**③ 继续追问(让 AI 帮你再深一步)**')
+
+        # 取出最近一次的讲解文本, 作为"上轮上下文"
+        last_text = (st.session_state[sid_hist][-1].get('text', '') if st.session_state[sid_hist] else '') or ''
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button('🔍 再讲细一点', key=f'ask_more_{mid}', use_container_width=True):
+                with st.spinner('细化中…'):
+                    res = llm.ask_more(m['question'], m['subject'], last_text)
+                st.session_state[sid_hist].append({'role': 'more', 'text': res.get('explanation', ''),
+                                                  'source': res.get('source', '')})
+                st.rerun()
+            if st.button('📝 出 3 道同类型变式', key=f'ask_similar_{mid}', use_container_width=True):
+                with st.spinner('出题中…'):
+                    res = llm.ask_similar(m['question'], m['subject'], last_text, n=3)
+                st.session_state[sid_hist].append({'role': 'similar', 'text': res.get('explanation', ''),
+                                                  'source': res.get('source', '')})
+                st.rerun()
+        with c2:
+            if st.button('🔁 换个方法', key=f'ask_alt_{mid}', use_container_width=True):
+                with st.spinner('找另解中…'):
+                    res = llm.ask_alternative(m['question'], m['subject'], last_text)
+                st.session_state[sid_hist].append({'role': 'alt', 'text': res.get('explanation', ''),
+                                                  'source': res.get('source', '')})
+                st.rerun()
+            if st.button('🖊️ 红笔批改', key=f'ask_error_{mid}', use_container_width=True):
+                # 红笔批改需要孩子先填答案, 这里只展开输入框, 不直接调 AI
+                pass
+
+        # ===== 红笔批改: 输入框 + 触发按钮 =====
+        with st.expander('🖊️ 红笔批改(填上你的答案, AI 帮你看错在哪)', expanded=False):
+            st.session_state[sid_kid_ans] = st.text_input(
+                '你的答案',
+                value=st.session_state[sid_kid_ans],
+                key=f'kid_ans_in_{mid}',
+                placeholder='把你刚才写的答案粘进来'
+            )
+            corr = st.text_input('正确答案(知道就填, 不知道留空)',
+                                 key=f'corr_in_{mid}',
+                                 placeholder='可选')
+            if st.button('请 AI 找茬', key=f'run_error_{mid}'):
+                kid_ans = st.session_state[sid_kid_ans].strip()
+                if not kid_ans:
+                    st.warning('请先填你的答案')
+                else:
+                    with st.spinner('批改中…'):
+                        res = llm.ask_explain_error(m['question'], m['subject'], kid_ans, corr or None)
+                    st.session_state[sid_hist].append({'role': 'error',
+                                                      'text': res.get('explanation', ''),
+                                                      'source': res.get('source', '')})
+                    st.rerun()
+
+        # ===== 我讲给你听: 复述 + 触发按钮 =====
+        with st.expander('🎤 我讲给你听(用自己的话讲一遍, AI 给你评分)', expanded=False):
+            st.session_state[sid_kid_tb] = st.text_area(
+                '请用自己的话讲一遍这道题',
+                value=st.session_state[sid_kid_tb],
+                key=f'kid_tb_in_{mid}',
+                height=120,
+                placeholder='例如: 这道题要先用公式把 X 算出来, 然后代入, 最后验证…'
+            )
+            if st.button('请 AI 点评', key=f'run_teachback_{mid}'):
+                kid_tb = st.session_state[sid_kid_tb].strip()
+                if not kid_tb:
+                    st.warning('请先复述一遍')
+                else:
+                    with st.spinner('听你讲…'):
+                        res = llm.ask_teach_back(m['question'], m['subject'], kid_tb)
+                    st.session_state[sid_hist].append({'role': 'teachback',
+                                                      'text': res.get('explanation', ''),
+                                                      'source': res.get('source', '')})
+                    st.rerun()
+
+    # ====== 我的好提示词 ======
+    st.divider()
+    st.markdown('**④ 我的好提示词(她点过的追问模板)**')
+    saved = db.get_good_prompts(mid)
+    if not saved:
+        st.caption('还没有收藏. 上方每次追问后, 都能点"⭐ 保存为我的好提示词".')
+    else:
+        st.success(f'已收藏 {len(saved)} 条')
+        for ln in saved:
+            c1, c2 = st.columns([6, 1])
+            with c1:
+                st.markdown(f'- {ln}')
+            with c2:
+                if st.button('🗑️', key=f'del_prompt_{mid}_{hash(ln) & 0xffff}'):
+                    db.delete_good_prompt(mid, ln)
+                    st.rerun()
+
+    # 重置按钮: 清掉当前这道题的对话状态, 重新开始
+    if step is not None:
+        st.divider()
+        if st.button('🔄 清空这次对话, 重新开始', key=f'reset_ai_{mid}', type='secondary'):
+            st.session_state[sid_hint] = None
+            st.session_state[sid_hist] = []
+            st.session_state[sid_kid_ans] = ''
+            st.session_state[sid_kid_tb] = ''
+            st.rerun()
+
+
 # ============== 侧边栏 ==============
 st.sidebar.title('📚 学习积累平台')
 st.sidebar.caption('13 岁孩子学习错题本地化记录')
@@ -218,16 +407,7 @@ elif page == '📖 错题本':
 
                 with tabs[2]:
                     st.caption(f"当前 AI 服务: {llm.config_info()['provider_display']}")
-                    if st.button(f'🤖 AI 讲题 #{m["id"]}', key=f'ai_{m["id"]}'):
-                        with st.spinner('生成中...'):
-                            res = llm.solve(m['question'], m['subject'])
-                            if res.get('answer'):
-                                st.success(f"**答案**: {res['answer']}")
-                            elif res.get('source') == 'llm-error':
-                                st.error('AI 老师调用失败 —— 具体原因见下方"思路"')
-                            st.markdown('**思路**')
-                            st.write(res.get('explanation', '暂无'))
-                            st.caption(f"来源: {res.get('source')}")
+                    _render_ai_tab(m)
 
                 with tabs[3]:
                     if st.button(f'🌐 联网搜题 #{m["id"]}', key=f'search_{m["id"]}'):
@@ -394,20 +574,32 @@ elif page == '👨‍👩‍👧 家长端':
     if st.session_state.get('parent_authed'):
         st.success('✅ 已登录家长端')
         s = db.stats_overview()
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric('总错题', s['total'])
         c2.metric('已掌握', s['mastered'])
         c3.metric('未掌握', s['unmastered'])
+        c4.metric('⭐ 好提示词', s.get('good_prompts_count', 0))
 
         st.divider()
         st.subheader('最近录入的 20 条错题')
         items = db.list_mistakes(limit=20)
         for m in items:
+            n_prompts = len(db.get_good_prompts(m['id']))
+            prompt_tag = f' · ⭐{n_prompts}' if n_prompts else ''
             st.markdown(
                 f"#{m['id']} [{m['subject']}] {m.get('title') or m['question'][:30]} "
                 f"— {m.get('wrong_reason') or '-'} (复习{m['review_count']}次) "
-                f"{'✅' if m['mastered'] else ''}"
+                f"{'✅' if m['mastered'] else ''}{prompt_tag}"
             )
+
+        st.divider()
+        st.subheader('⭐ 她最近收藏的好提示词')
+        recent = db.list_recent_good_prompts(limit=10)
+        if not recent:
+            st.caption('还没有. 孩子在 AI 讲题标签点"⭐ 保存为我的好提示词"后, 会出现在这里.')
+        else:
+            for mid, ln in recent:
+                st.markdown(f"- `#{mid}` — {ln}")
 
         st.divider()
         st.subheader('数据导出')

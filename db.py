@@ -79,6 +79,16 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # 兼容旧库: 字段不存在则追加. SQLite 没有 IF NOT EXISTS, 用 PRAGMA 兜底.
+        _ensure_column(conn, 'mistakes', 'good_prompts', 'TEXT')
+
+
+def _ensure_column(conn, table: str, column: str, definition: str):
+    """如果列不存在则 ALTER TABLE 追加"""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = {r['name'] for r in cur.fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 # ============== 错题 CRUD ==============
@@ -138,6 +148,52 @@ def update_mistake(mid, **kwargs):
 def delete_mistake(mid):
     with get_conn() as conn:
         conn.execute("DELETE FROM mistakes WHERE id=?", (mid,))
+
+
+# ============== 好提示词 (孩子点过的追问模板) ==============
+def append_good_prompt(mid, text: str):
+    """
+    把孩子"收藏的好提示词"追加到错题. 自动去重, 含时间戳.
+    存储格式: 每行 "[YYYY-MM-DD HH:MM] <text>"
+    """
+    text = (text or '').strip()
+    if not text:
+        return False
+    with get_conn() as conn:
+        row = conn.execute("SELECT good_prompts FROM mistakes WHERE id=?", (mid,)).fetchone()
+        if not row:
+            return False
+        existing = row['good_prompts'] or ''
+        # 去重: 完全相同就不重复加
+        if text in existing:
+            return False
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+        line = f"[{ts}] {text}"
+        new = (existing + "\n" + line) if existing else line
+        conn.execute("UPDATE mistakes SET good_prompts=? WHERE id=?", (new, mid))
+        return True
+
+
+def get_good_prompts(mid) -> list:
+    """返回错题的好提示词列表(去掉空行, 保持原顺序)"""
+    with get_conn() as conn:
+        row = conn.execute("SELECT good_prompts FROM mistakes WHERE id=?", (mid,)).fetchone()
+        if not row or not row['good_prompts']:
+            return []
+        return [ln for ln in row['good_prompts'].split('\n') if ln.strip()]
+
+
+def delete_good_prompt(mid, text: str):
+    """删除一条好提示词(按整行精确匹配)"""
+    if not text:
+        return
+    with get_conn() as conn:
+        row = conn.execute("SELECT good_prompts FROM mistakes WHERE id=?", (mid,)).fetchone()
+        if not row or not row['good_prompts']:
+            return
+        lines = [ln for ln in row['good_prompts'].split('\n') if ln.strip() and ln.strip() != text.strip()]
+        conn.execute("UPDATE mistakes SET good_prompts=? WHERE id=?",
+                     ('\n'.join(lines), mid))
 
 
 def mark_reviewed(mid, rating, note=None):
@@ -223,7 +279,39 @@ def stats_overview():
         'unmastered': total - mastered,
         'by_subject': [dict(r) for r in by_subj],
         'recent_30d': [dict(r) for r in recent],
+        'good_prompts_count': _count_good_prompts(),
     }
+
+
+def _count_good_prompts() -> int:
+    """统计全库好提示词总数(按行算, 每行一条)"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT good_prompts FROM mistakes WHERE good_prompts IS NOT NULL AND good_prompts != ''"
+        ).fetchall()
+    n = 0
+    for r in row:
+        n += sum(1 for ln in (r['good_prompts'] or '').split('\n') if ln.strip())
+    return n
+
+
+def list_recent_good_prompts(limit: int = 20) -> list:
+    """返回最近收藏的好提示词(跨错题), [(mid, line), ...]"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, good_prompts FROM mistakes "
+            "WHERE good_prompts IS NOT NULL AND good_prompts != '' "
+            "ORDER BY id DESC"
+        ).fetchall()
+    out = []
+    for r in rows:
+        for ln in (r['good_prompts'] or '').split('\n'):
+            ln = ln.strip()
+            if ln:
+                out.append((r['id'], ln))
+    # 倒序: 后加入的在前
+    out.reverse()
+    return out[:limit]
 
 
 # ============== 家长端 ==============
