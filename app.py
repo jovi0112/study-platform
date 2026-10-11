@@ -24,6 +24,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 SUBJECTS = ['数学', '语文', '英语', '物理', '化学', '生物', '历史', '地理', '政治', '其他']
 WRONG_REASONS = ['概念不清', '计算失误', '审题错误', '公式记错', '思路不对', '粗心', '时间不够', '没学过']
 
+# 侧边栏签名(孩子可在「我的工作室 → 我的签名」里改, 20 汉字以内)
+DEFAULT_SIGNATURE = '13 岁孩子学习错题本地化记录'
+SIGNATURE_MAX = 20
+
 st.set_page_config(
     page_title='学习积累平台',
     page_icon='📚',
@@ -273,7 +277,7 @@ def _render_ai_tab(m):
 
 # ============== 侧边栏 ==============
 st.sidebar.title('📚 学习积累平台')
-st.sidebar.caption('13 岁孩子学习错题本地化记录')
+st.sidebar.caption(db.get_setting('signature', DEFAULT_SIGNATURE) or DEFAULT_SIGNATURE)
 page = st.sidebar.radio('导航', [
     '📷 拍照录入',
     '📖 错题本',
@@ -583,7 +587,7 @@ elif page == '🧪 我的工作室':
     st.title('🧪 我的工作室')
     st.caption('这个平台是你的. 觉得哪里不好用? 想要新功能? 自己造追问? 都在这里.')
 
-    tab_wish, tab_forge, tab_guide = st.tabs(['💡 许愿池', '✨ 提示词工坊', '📖 使用手册'])
+    tab_wish, tab_forge, tab_guide, tab_sign = st.tabs(['💡 许愿池', '✨ 提示词工坊', '📖 使用手册', '✍️ 我的签名'])
 
     # ---------- ① 许愿池 ----------
     with tab_wish:
@@ -681,6 +685,43 @@ elif page == '🧪 我的工作室':
                 st.markdown(f.read())
         else:
             st.info('手册文件(KIDS_GUIDE.md)不存在, 仓库里找.')
+
+    # ---------- ④ 我的签名 ----------
+    with tab_sign:
+        st.subheader('✍️ 我的签名')
+        st.caption('左上角标题下面那句话, 现在归你了 —— 想写什么写什么, 20 个汉字以内.')
+
+        cur_sig = db.get_setting('signature', DEFAULT_SIGNATURE) or DEFAULT_SIGNATURE
+        # 用 session_state 托管输入框, 便于"恢复默认"时同步刷新
+        if 'sig_input' not in st.session_state:
+            st.session_state['sig_input'] = cur_sig
+
+        sig = st.text_input('我的个性签名', key='sig_input', max_chars=SIGNATURE_MAX,
+                            placeholder='例如: 每天进步一点点 / 数学, 我来啦')
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            if st.button('💾 保存签名', type='primary', use_container_width=True):
+                s = (sig or '').strip()
+                if not s:
+                    st.error('签名不能为空哦')
+                elif len(s) > SIGNATURE_MAX:
+                    st.error(f'太长了, {SIGNATURE_MAX} 个汉字以内')
+                else:
+                    db.set_setting('signature', s)
+                    st.success('已保存! 看左上角 👈')
+                    time.sleep(0.4)
+                    st.rerun()
+        with c2:
+            if st.button('↩️ 恢复默认', use_container_width=True):
+                db.set_setting('signature', DEFAULT_SIGNATURE)
+                st.session_state['sig_input'] = DEFAULT_SIGNATURE
+                st.rerun()
+        with c3:
+            st.caption(f'已写 {len(sig or "")}/{SIGNATURE_MAX} 字')
+
+        st.divider()
+        st.caption('提示: 这句话会一直显示在左上角, 每次打开平台都能看到 —— 像给自己取的一句口头禅.')
 
 
 # ============== 页面 6: 家长端 ==============
