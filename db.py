@@ -56,9 +56,29 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS wishes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,           -- 愿望内容: 觉得哪里不好用/想要什么功能
+    category TEXT DEFAULT '想法',    -- 不好用/想要功能/想法
+    status TEXT DEFAULT '新',        -- 新/尝试中/已解决/放弃
+    note TEXT,                       -- 处理备注(她自己做实验的记录)
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS custom_prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,              -- 模板名: "举个例子版讲解"
+    prompt_text TEXT NOT NULL,       -- 模板内容, 可含 {题目} 占位符
+    use_count INTEGER DEFAULT 0,     -- 被用过几次
+    last_used TEXT,                  -- 最近一次使用
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_mistakes_subject ON mistakes(subject);
 CREATE INDEX IF NOT EXISTS idx_mistakes_knowledge ON mistakes(knowledge_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_mistake ON reviews(mistake_id);
+CREATE INDEX IF NOT EXISTS idx_wishes_status ON wishes(status);
 """
 
 
@@ -335,3 +355,84 @@ def ensure_parent_pin():
         set_setting('parent_pin', pin)
         set_setting('parent_pin_initialized', datetime.now().isoformat(timespec='seconds'))
     return pin
+
+
+# ============== 许愿池 (孩子提需求 / 记录不足) ==============
+def add_wish(content: str, category: str = '想法') -> int:
+    content = (content or '').strip()
+    if not content:
+        return None
+    now = datetime.now().isoformat(timespec='seconds')
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO wishes (content, category, status, created_at) VALUES (?,?,?,?)",
+            (content, category or '想法', '新', now))
+        return cur.lastrowid
+
+
+def list_wishes(status=None, limit=100):
+    sql = "SELECT * FROM wishes"
+    params = []
+    if status and status != '全部':
+        sql += " WHERE status = ?"
+        params.append(status)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def update_wish(wid, status=None, note=None):
+    now = datetime.now().isoformat(timespec='seconds')
+    with get_conn() as conn:
+        if status is not None and note is not None:
+            conn.execute("UPDATE wishes SET status=?, note=?, updated_at=? WHERE id=?",
+                         (status, note, now, wid))
+        elif status is not None:
+            conn.execute("UPDATE wishes SET status=?, updated_at=? WHERE id=?", (status, now, wid))
+        elif note is not None:
+            conn.execute("UPDATE wishes SET note=?, updated_at=? WHERE id=?", (note, now, wid))
+
+
+def delete_wish(wid):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM wishes WHERE id=?", (wid,))
+
+
+# ============== 提示词工坊 (孩子自造追问模板) ==============
+def add_custom_prompt(name: str, prompt_text: str) -> int:
+    name = (name or '').strip()
+    prompt_text = (prompt_text or '').strip()
+    if not name or not prompt_text:
+        return None
+    now = datetime.now().isoformat(timespec='seconds')
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO custom_prompts (name, prompt_text, use_count, created_at) VALUES (?,?,0,?)",
+            (name, prompt_text, now))
+        return cur.lastrowid
+
+
+def list_custom_prompts():
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM custom_prompts ORDER BY use_count DESC, id DESC").fetchall()]
+
+
+def get_custom_prompt(pid):
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM custom_prompts WHERE id=?", (pid,)).fetchone()
+        return dict(r) if r else None
+
+
+def bump_prompt_use(pid):
+    """使用次数 +1, 更新最近使用时间"""
+    now = datetime.now().isoformat(timespec='seconds')
+    with get_conn() as conn:
+        conn.execute("UPDATE custom_prompts SET use_count=use_count+1, last_used=? WHERE id=?",
+                     (now, pid))
+
+
+def delete_custom_prompt(pid):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM custom_prompts WHERE id=?", (pid,))

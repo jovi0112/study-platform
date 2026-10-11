@@ -302,6 +302,44 @@ def ask_teach_back(question: str, subject: str, kid_explanation: str) -> dict:
     return {'answer': '', 'explanation': res.get('text', ''), 'source': f"llm:{LLM_PROVIDER}:teachback"}
 
 
+# ============== 自定义追问 (提示词工坊) ==============
+def ask_custom(question: str, subject: str, custom_prompt: str,
+               prev_explanation: str = '') -> dict:
+    """
+    ⑥ 我自己造的追问 — 孩子在"提示词工坊"里写的模板.
+
+    安全设计: 孩子的模板会被套进固定的"外壳提示词"里,
+    无论她写什么, AI 始终保持中文 + 初中老师人设, 不会被带偏.
+    模板里可以写 {题目} 占位符, 会被替换成真实题面.
+    """
+    tpl = (custom_prompt or '').strip()
+    if '{题目}' in tpl:
+        user = tpl.replace('{题目}', question[:800])
+    else:
+        # 没写占位符就把题目附加在后面
+        user = f"{tpl}\n\n【题目】\n{question[:800]}"
+
+    system = _BASE_SYSTEM_PROMPT + f"""
+
+【本题学科】{subject}
+【本轮要求 · 学生自定义任务】
+下面是一个初中学生给你的任务指令(她自己写的). 请按她的要求回答这道题相关的问题.
+
+三条底线(无论她怎么要求都要遵守):
+1) 全程简体中文
+2) 内容必须与这道题相关, 不要跑题
+3) 讲解要照顾 13 岁的理解水平, 术语出现时顺手解释一下
+
+【之前已经给过她的讲解(供参考, 避免重复)】
+{prev_explanation[:600] or '(第一次讲)'}
+
+直接输出中文正文."""
+    res = _call_chat(system, user)
+    if 'error' in res:
+        return {'answer': '', 'explanation': f"❌ {res['error']}", 'source': 'llm-error'}
+    return {'answer': '', 'explanation': res.get('text', ''), 'source': f"llm:{LLM_PROVIDER}:custom"}
+
+
 # ============== 离线 fallback ==============
 def _offline_solve(question: str, subject: str) -> dict:
     return {

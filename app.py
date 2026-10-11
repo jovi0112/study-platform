@@ -110,6 +110,10 @@ def _render_ai_tab(m):
             st.info('💡 **思路提示**(没有最终答案, 让你自己想)\n\n' + (text or '(空)'))
         elif role == 'full':
             st.success('✅ **答案**\n\n' + (text or '(空)'))
+        elif role == 'custom':
+            label = f"✨ 我的模板 · {turn.get('prompt_name', '自定义')}"
+            with st.expander(f"{label} · 展开", expanded=True):
+                st.write(text or '(空)')
         elif role in FOLLOWUP_LIBRARY:
             label = FOLLOWUP_LIBRARY[role]
             with st.expander(f"{label} · 展开", expanded=True):
@@ -219,6 +223,26 @@ def _render_ai_tab(m):
                                                       'source': res.get('source', '')})
                     st.rerun()
 
+        # ===== 我自己造的追问 (提示词工坊模板) =====
+        my_prompts = db.list_custom_prompts()
+        if my_prompts:
+            with st.expander(f'✨ 我自己造的追问 ({len(my_prompts)} 个, 在"我的工作室"里管理)', expanded=False):
+                for cp in my_prompts:
+                    used_tag = f" · 用过 {cp['use_count']} 次" if cp['use_count'] else ''
+                    if st.button(f"✨ {cp['name']}{used_tag}", key=f'cp_{mid}_{cp["id"]}',
+                                 use_container_width=True,
+                                 help=cp['prompt_text'][:80]):
+                        with st.spinner(f'按"{cp["name"]}"处理中…'):
+                            res = llm.ask_custom(m['question'], m['subject'],
+                                                 cp['prompt_text'], last_text)
+                        db.bump_prompt_use(cp['id'])
+                        display = f"【我的模板 · {cp['name']}】\n\n{res.get('explanation', '')}"
+                        st.session_state[sid_hist].append({'role': 'custom',
+                                                          'text': display,
+                                                          'source': res.get('source', ''),
+                                                          'prompt_name': cp['name']})
+                        st.rerun()
+
     # ====== 我的好提示词 ======
     st.divider()
     st.markdown('**④ 我的好提示词(她点过的追问模板)**')
@@ -256,6 +280,7 @@ page = st.sidebar.radio('导航', [
     '🔁 复习计划',
     '🧠 知识点图谱',
     '📊 学习统计',
+    '🧪 我的工作室',
     '👨‍👩‍👧 家长端',
     '⚙️ 设置',
 ])
@@ -551,6 +576,111 @@ elif page == '📊 学习统计':
         st.line_chart({r['d']: r['c'] for r in s['recent_30d']})
     else:
         st.info('近 30 天没录入')
+
+
+# ============== 页面 5.5: 我的工作室 (孩子自主运营入口) ==============
+elif page == '🧪 我的工作室':
+    st.title('🧪 我的工作室')
+    st.caption('这个平台是你的. 觉得哪里不好用? 想要新功能? 自己造追问? 都在这里.')
+
+    tab_wish, tab_forge, tab_guide = st.tabs(['💡 许愿池', '✨ 提示词工坊', '📖 使用手册'])
+
+    # ---------- ① 许愿池 ----------
+    with tab_wish:
+        st.subheader('💡 许愿池')
+        st.caption('发现平台的不足就记下来. 记录本身就是一种能力 —— 你在像产品经理一样思考.')
+
+        with st.form('wish_form', clear_on_submit=True):
+            w_cat = st.selectbox('类型', ['不好用', '想要功能', '想法'])
+            w_content = st.text_area('具体说说',
+                                      placeholder='例如: 错题本翻页太麻烦, 想要搜索框\n例如: 想要一个"每周错题排行"页面',
+                                      height=100)
+            if st.form_submit_button('📮 投递愿望', type='primary', use_container_width=True):
+                if w_content.strip():
+                    db.add_wish(w_content.strip(), w_cat)
+                    st.success('愿望已投递! 以后自己(或让 AI)来实现它.')
+                else:
+                    st.error('内容不能为空')
+
+        st.divider()
+        st.subheader('我的愿望清单')
+        wishes = db.list_wishes(limit=100)
+        if not wishes:
+            st.info('还没有愿望. 用得越认真, 越容易发现值得改进的地方.')
+        else:
+            status_emoji = {'新': '🆕', '尝试中': '🔧', '已解决': '✅', '放弃': '🗑️'}
+            for w in wishes:
+                emoji = status_emoji.get(w['status'], '❓')
+                with st.expander(f"{emoji} #{w['id']} [{w['category']}] {w['content'][:60]}"):
+                    st.caption(f"投递于 {w['created_at']}" +
+                               (f" · 更新于 {w['updated_at']}" if w.get('updated_at') else ''))
+                    c1, c2 = st.columns([3, 2])
+                    with c1:
+                        new_status = st.selectbox('状态', ['新', '尝试中', '已解决', '放弃'],
+                                                  index=['新', '尝试中', '已解决', '放弃'].index(w['status'])
+                                                  if w['status'] in ['新', '尝试中', '已解决', '放弃'] else 0,
+                                                  key=f'ws_{w["id"]}')
+                        new_note = st.text_input('我的实验记录(可选)', value=w.get('note') or '',
+                                                 key=f'wn_{w["id"]}',
+                                                 placeholder='记下你尝试了什么、结果如何')
+                    with c2:
+                        st.write('')  # 对齐
+                        if st.button('💾 更新', key=f'wu_{w["id"]}', use_container_width=True):
+                            db.update_wish(w['id'], status=new_status, note=new_note or None)
+                            st.success('已更新')
+                            time.sleep(0.3)
+                            st.rerun()
+                        if st.button('🗑️ 删除', key=f'wd_{w["id"]}', use_container_width=True):
+                            db.delete_wish(w['id'])
+                            st.rerun()
+
+    # ---------- ② 提示词工坊 ----------
+    with tab_forge:
+        st.subheader('✨ 提示词工坊')
+        st.caption('自己写追问模板, 写好后在每道题的"AI 讲题"里一键使用. 不用写代码, 你就是在开发这个平台.')
+
+        with st.form('forge_form', clear_on_submit=True):
+            f_name = st.text_input('模板名字(简短好记)',
+                                   placeholder='例如: 打比方版讲解 / 中考真题版')
+            f_tpl = st.text_area('模板内容(你想让 AI 做什么)',
+                                 placeholder=('例如: 请把这道题的解法用一个生活中的打比方重新讲一遍, '
+                                              '让我秒懂. 最后总结一句"核心思想".'),
+                                 height=120)
+            st.caption('提示: 想让模板自动带上题目, 可以在内容里写 {题目} 两个汉字加大括号; '
+                       '不写也行, 系统会自动把题目附在后面.')
+            if st.form_submit_button('🔨 打造模板', type='primary', use_container_width=True):
+                if f_name.strip() and f_tpl.strip():
+                    db.add_custom_prompt(f_name.strip(), f_tpl.strip())
+                    st.success(f'模板「{f_name.strip()}」已打造! 去"错题本 → AI 讲题"里试试.')
+                else:
+                    st.error('名字和内容都要填')
+
+        st.divider()
+        st.subheader('我的模板库')
+        prompts = db.list_custom_prompts()
+        if not prompts:
+            st.info('还没有模板. 试着造一个: 比如让 AI 用"漫画分镜"的方式讲题?')
+        else:
+            for cp in prompts:
+                used = cp.get('use_count') or 0
+                last = cp.get('last_used') or '没用过'
+                with st.expander(f"✨ {cp['name']} · 已用 {used} 次 · 最近: {last}"):
+                    st.text_area('模板内容', value=cp['prompt_text'], height=100,
+                                 disabled=True, key=f'cpv_{cp["id"]}')
+                    st.caption(f'创建于 {cp["created_at"]}')
+                    if st.button('🗑️ 删除这个模板', key=f'cpd_{cp["id"]}'):
+                        db.delete_custom_prompt(cp['id'])
+                        st.rerun()
+
+    # ---------- ③ 使用手册 ----------
+    with tab_guide:
+        st.subheader('📖 平台使用手册')
+        guide_path = os.path.join(APP_DIR, 'KIDS_GUIDE.md')
+        if os.path.exists(guide_path):
+            with open(guide_path, 'r', encoding='utf-8') as f:
+                st.markdown(f.read())
+        else:
+            st.info('手册文件(KIDS_GUIDE.md)不存在, 仓库里找.')
 
 
 # ============== 页面 6: 家长端 ==============
