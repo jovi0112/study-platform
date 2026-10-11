@@ -60,11 +60,12 @@ def _ddg_html_search(query: str, max_results: int = 5) -> List[Dict]:
 
 def _bing_html_search(query: str, max_results: int = 5) -> List[Dict]:
     """
-    Bing 国内版 fallback
+    Bing 国内版 (大陆可直连, 结果偏中文)
     """
     url = "https://cn.bing.com/search"
     try:
-        r = requests.get(url, params={'q': query}, headers={'User-Agent': UA}, timeout=TIMEOUT)
+        r = requests.get(url, params={'q': query, 'mkt': 'zh-CN', 'setlang': 'zh-CN'},
+                         headers={'User-Agent': UA}, timeout=TIMEOUT)
         r.raise_for_status()
     except Exception as e:
         return [{'title': 'Bing 搜索失败', 'href': '', 'snippet': str(e), 'error': True}]
@@ -88,13 +89,15 @@ def _bing_html_search(query: str, max_results: int = 5) -> List[Dict]:
 
 
 def _multi_engine_search(query: str, max_results: int = 5) -> List[Dict]:
-    """多引擎兜底: DDG -> Bing"""
-    res = _ddg_html_search(query, max_results)
-    # 过滤掉错误和"未匹配"占位
+    """
+    多引擎: Bing(国内可直连, 中文结果优先) -> DuckDuckGo 兜底
+    注意: DuckDuckGo 在中国大陆通常无法访问, 所以放在后面
+    """
+    res = _bing_html_search(query, max_results)
     real = [r for r in res if not r.get('error') and '未匹配' not in r.get('title', '')]
     if real:
         return real
-    return _bing_html_search(query, max_results)
+    return _ddg_html_search(query, max_results)
 
 
 def fetch_page_text(url: str, max_chars: int = 2000) -> str:
@@ -119,10 +122,17 @@ def solve_with_search(question: str, subject: str = '通用',
     主入口: 搜题 + 抓前 2 个链接的正文摘要
     """
     if not question or not question.strip():
-        return {'results': [], 'summary': '题目为空', 'source': 'empty'}
+        return {'results': [], 'summary': '题目为空', 'cn_summary': '', 'source': 'empty'}
 
-    # 学科前缀增强命中率
-    query = f"{subject} {question[:80]}" if subject and subject != '通用' else question[:80]
+    # 组查询词: 追加中文关键词, 让结果更偏向国内教辅/解析类页面
+    q = (question or '').replace('\n', ' ').strip()[:80]
+    if subject == '英语':
+        query = f"{q} 阅读理解 答案 解析 翻译"
+    elif subject and subject != '通用':
+        query = f"{subject} {q} 答案 解析"
+    else:
+        query = f"{q} 答案 解析"
+
     results = _multi_engine_search(query, max_results=fetch_top + 2)
 
     summary_parts = []
@@ -138,9 +148,20 @@ def solve_with_search(question: str, subject: str = '通用',
                 break
 
     summary = '\n\n---\n\n'.join(summary_parts) if summary_parts else '未抓取到正文.'
+
+    # 抓到的多为英文网页 -> 交给 LLM 用中文重讲一遍(未配置 LLM 时返回空串)
+    cn_summary = ''
+    if summary_parts:
+        try:
+            import llm as _llm
+            cn_summary = _llm.summarize_references(question, subject, summary)
+        except Exception:
+            cn_summary = ''
+
     return {
         'query': query,
         'results': results,
         'summary': summary,
-        'source': 'duckduckgo+bing',
+        'cn_summary': cn_summary,
+        'source': 'bing+duckduckgo',
     }

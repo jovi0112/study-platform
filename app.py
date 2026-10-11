@@ -76,7 +76,7 @@ ocr_status = "✅ 就绪" if ocr.is_available() else f"❌ {ocr._engine_error or
 st.sidebar.markdown(f"**OCR**: {ocr_status}", unsafe_allow_html=True)
 llm_info = llm.config_info()
 llm_status = "✅ 已启用" if llm_info['enabled'] else "⚠️ 离线"
-st.sidebar.markdown(f"**AI 老师**: {llm_status} ({llm_info['provider']})", unsafe_allow_html=True)
+st.sidebar.markdown(f"**AI 老师**: {llm_status} ({llm_info['provider_display']})", unsafe_allow_html=True)
 
 st.sidebar.divider()
 st.sidebar.caption(f"v0.1 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -217,12 +217,14 @@ elif page == '📖 错题本':
                         st.info('无图片')
 
                 with tabs[2]:
-                    st.caption(f"当前 AI 状态: {llm.config_info()['provider']}")
+                    st.caption(f"当前 AI 服务: {llm.config_info()['provider_display']}")
                     if st.button(f'🤖 AI 讲题 #{m["id"]}', key=f'ai_{m["id"]}'):
                         with st.spinner('生成中...'):
                             res = llm.solve(m['question'], m['subject'])
                             if res.get('answer'):
                                 st.success(f"**答案**: {res['answer']}")
+                            elif res.get('source') == 'llm-error':
+                                st.error('AI 老师调用失败 —— 具体原因见下方"思路"')
                             st.markdown('**思路**')
                             st.write(res.get('explanation', '暂无'))
                             st.caption(f"来源: {res.get('source')}")
@@ -231,13 +233,19 @@ elif page == '📖 错题本':
                     if st.button(f'🌐 联网搜题 #{m["id"]}', key=f'search_{m["id"]}'):
                         with st.spinner('搜索中...'):
                             res = web_search.solve_with_search(m['question'], m['subject'])
+                            cn = (res.get('cn_summary') or '').strip()
+                            if cn and not cn.startswith('['):
+                                st.markdown('**AI 中文解读**')
+                                st.write(cn)
+                                st.divider()
                             for r in res['results']:
                                 st.markdown(f"- [{r['title']}]({r['href']})")
                                 if r.get('snippet'):
                                     st.caption(r['snippet'])
                             st.divider()
-                            st.markdown('**前 2 条页面摘要**')
-                            st.write(res['summary'])
+                            st.markdown('**原始网页摘要**')
+                            with st.expander('展开查看(原文多为英文)', expanded=not cn):
+                                st.write(res['summary'])
 
                 with tabs[4]:
                     st.write(f"复习次数: {m['review_count']}, 上次: {m.get('last_reviewed') or '未复习'}")
