@@ -604,24 +604,54 @@ elif page == '📖 错题本':
                         st.rerun()
 
                 with tabs[5]:
-                    new_reason = st.selectbox('改错因', WRONG_REASONS,
+                    st.markdown('**✏️ 修改这条错题**(识图认错了? 直接在这里改, 不用重新拍)')
+                    new_q = st.text_area('题面', value=m['question'], height=120, key=f'q_{m["id"]}')
+                    new_ans = st.text_input('孩子当时的答案', value=m.get('answer') or '', key=f'ans_{m["id"]}')
+                    new_reason = st.selectbox('错因', WRONG_REASONS,
                                               index=WRONG_REASONS.index(m['wrong_reason']) if m.get('wrong_reason') in WRONG_REASONS else 0,
                                               key=f'reason_{m["id"]}')
-                    new_corr = st.text_input('改正确答案', value=m.get('correct_answer') or '', key=f'corr_{m["id"]}')
+                    new_corr = st.text_input('正确答案', value=m.get('correct_answer') or '', key=f'corr_{m["id"]}')
                     new_exp = st.text_area('补充思路', value=m.get('explanation') or '', key=f'exp_{m["id"]}')
                     if st.button(f'💾 保存修改 #{m["id"]}', key=f'sv_{m["id"]}'):
                         db.update_mistake(m['id'],
+                                          question=new_q.strip() or m['question'],
+                                          answer=new_ans or None,
                                           wrong_reason=new_reason,
                                           correct_answer=new_corr or None,
                                           explanation=new_exp or None)
                         st.success('已更新')
                         time.sleep(0.5)
                         st.rerun()
-                    if st.button(f'🗑️ 删除 #{m["id"]}', key=f'del_{m["id"]}', type='secondary'):
-                        db.delete_mistake(m['id'])
-                        st.success('已删除')
-                        time.sleep(0.5)
-                        st.rerun()
+
+                    # ---- 删除: 两步确认, 防止孩子手滑把错题点没了 ----
+                    st.divider()
+                    _ck = f'confirm_del_{m["id"]}'
+                    if st.session_state.get(_ck):
+                        st.warning(f'确定要删除 #{m["id"]} 这条错题吗? 删了就找不回来了!')
+                        _c1, _c2 = st.columns(2)
+                        if _c1.button(f'❗ 确认删除 #{m["id"]}', key=f'delyes_{m["id"]}', type='primary'):
+                            # 顺带清理这张题的图片文件(只动上传目录里的, 不碰别处)
+                            _img = m.get('image_path')
+                            if _img:
+                                try:
+                                    _p = relative_to_abs(_img)
+                                    if _p and os.path.exists(_p) and \
+                                       os.path.abspath(_p).startswith(os.path.abspath(UPLOAD_DIR)):
+                                        os.remove(_p)
+                                except Exception:
+                                    pass  # 图片删不掉不影响条目删除
+                            db.delete_mistake(m['id'])
+                            st.session_state.pop(_ck, None)
+                            st.success('已删除')
+                            time.sleep(0.5)
+                            st.rerun()
+                        if _c2.button(f'↩️ 不删了 #{m["id"]}', key=f'delno_{m["id"]}'):
+                            st.session_state.pop(_ck, None)
+                            st.rerun()
+                    else:
+                        if st.button(f'🗑️ 删除这条错题 #{m["id"]}', key=f'del_{m["id"]}'):
+                            st.session_state[_ck] = True
+                            st.rerun()
 
 
 # ============== 页面 3: 复习计划 ==============
