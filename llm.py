@@ -33,9 +33,90 @@ LLM_API_KEY = _read_secret('STUDY_LLM_API_KEY', '')
 LLM_BASE_URL = _read_secret('STUDY_LLM_BASE_URL', '')
 LLM_MODEL = _read_secret('STUDY_LLM_MODEL', '')
 
+# ---- 看图(Vision): 与讲题分开配置, 互不干扰 ----
+# 讲题用 DeepSeek(纯文本) 完全够用; 看图必须换一个"带眼睛"的模型.
+# 可选: 通义 qwen-vl-max / 智谱 glm-4v-flash / 硅基流动 Qwen2.5-VL / OpenAI gpt-4o-mini
+VISION_API_KEY = _read_secret('STUDY_VISION_API_KEY', '')
+VISION_BASE_URL = _read_secret('STUDY_VISION_BASE_URL', '')
+VISION_MODEL = _read_secret('STUDY_VISION_MODEL', '')
+
 
 def is_llm_enabled() -> bool:
     return LLM_PROVIDER != 'offline' and bool(LLM_API_KEY)
+
+
+def vision_status() -> dict:
+    """
+    看图功能状态. 返回 {enabled, reason, model, base_url}
+    reason 是给人看的话, UI 直接显示即可(避免"配置错了却提示成功"的假象)
+    """
+    if not VISION_API_KEY:
+        return {'enabled': False, 'reason': '未配 Key',
+                'model': VISION_MODEL or '(未填)', 'base_url': VISION_BASE_URL or '(未填)'}
+    if not VISION_BASE_URL or not VISION_MODEL:
+        return {'enabled': False,
+                'reason': 'Key 有了, 但还缺 STUDY_VISION_BASE_URL 或 STUDY_VISION_MODEL',
+                'model': VISION_MODEL or '(未填)', 'base_url': VISION_BASE_URL or '(未填)'}
+    if 'deepseek' in VISION_BASE_URL.lower():
+        return {'enabled': False,
+                'reason': 'DeepSeek 不支持看图, 请换成通义/智谱/OpenAI/硅基流动等视觉模型',
+                'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
+    return {'enabled': True, 'reason': '已启用', 'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
+
+
+def is_vision_enabled() -> bool:
+    return vision_status()['enabled']
+
+
+_VISION_PROMPT = """你是"题目抄写员"。请只看图、照抄，不要动脑解题。
+
+任务: 把图片里的题目原文【完整、逐字】抄录出来。
+
+要求:
+1) 只输出题目文字本身, 不要写"这道题是关于…"之类的话, 不要解题, 不要给答案。
+2) 数学式子要尽量还原: 分数写成"分子/分母"或"½"都行, 乘号用 ×, 除号用 ÷, 平方写成 ^2 或 ²。
+3) 手写体也要尽力辨认; 实在认不出的字用"□"代替, 不要瞎猜。
+4) 有多道题就按"1) 2) 3)"分行写, 保留原来的题号。
+5) 孩子写的解题过程/答案如果也在图里, 单独用一行"--- 孩子的作答 ---"隔开抄出来。
+6) 输出简体中文正文, 不要 Markdown 代码块。"""
+
+
+def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通用') -> dict:
+    """
+    AI 看图: 把图片交给视觉模型抄出题目原文.
+
+    返回: {'success': bool, 'text': str, 'error': str|None, 'model': str}
+    """
+    stt = vision_status()
+    if not stt['enabled']:
+        return {'success': False, 'text': '', 'error': f"看图功能未启用: {stt['reason']}",
+                'model': stt['model']}
+    if not image_bytes:
+        return {'success': False, 'text': '', 'error': '图片为空', 'model': stt['model']}
+    try:
+        from openai import OpenAI
+        import base64 as _b64
+        client = OpenAI(api_key=VISION_API_KEY, base_url=VISION_BASE_URL or None)
+        b64 = _b64.b64encode(image_bytes).decode('utf-8')
+        resp = client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": _VISION_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": f"学科: {subject}\n请把图里的题目原文抄出来。"},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ]},
+            ],
+            temperature=0.0,
+            timeout=90,
+        )
+        text = (resp.choices[0].message.content or '').strip()
+        if not text:
+            return {'success': False, 'text': '', 'error': '模型返回空内容', 'model': VISION_MODEL}
+        return {'success': True, 'text': text, 'error': None, 'model': VISION_MODEL}
+    except Exception as e:
+        return {'success': False, 'text': '', 'error': _humanize_error(str(e)), 'model': VISION_MODEL}
 
 
 # ============== 共享提示词前缀 ==============
@@ -387,6 +468,7 @@ def config_info() -> dict:
         'model': LLM_MODEL or '(默认)',
         'base_url': LLM_BASE_URL or '(默认)',
         'api_key_set': bool(LLM_API_KEY),
+        'vision': vision_status(),
     }
 
 

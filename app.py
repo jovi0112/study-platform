@@ -290,11 +290,13 @@ page = st.sidebar.radio('导航', [
 ])
 
 st.sidebar.divider()
-ocr_status = "✅ 就绪" if ocr.is_available() else f"❌ {ocr._engine_error or '加载中'}"
-st.sidebar.markdown(f"**OCR**: {ocr_status}", unsafe_allow_html=True)
+ocr_status = "✅ 就绪" if ocr.is_available() else f"❌ {ocr.engine_error() or '加载中'}"
+st.sidebar.markdown(f"**识图(本地)**: {ocr_status}", unsafe_allow_html=True)
 llm_info = llm.config_info()
 llm_status = "✅ 已启用" if llm_info['enabled'] else "⚠️ 离线"
 st.sidebar.markdown(f"**AI 老师**: {llm_status} ({llm_info['provider_display']})", unsafe_allow_html=True)
+_vs = llm.vision_status()
+st.sidebar.markdown(f"**AI 看图**: {'✅ 已启用' if _vs['enabled'] else '⚪ 未开启'}", unsafe_allow_html=True)
 
 st.sidebar.divider()
 st.sidebar.caption(f"v0.1 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -303,7 +305,7 @@ st.sidebar.caption(f"v0.1 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 # ============== 页面 1: 拍照录入 ==============
 if page == '📷 拍照录入':
     st.title('📷 拍照录入错题')
-    st.caption('用手机拍题目, 上传后自动 OCR 识别, 孩子再补全/修改. 不联网传图, 纯本地.')
+    st.caption('拍题上传 → 本地自动识图(多方案择优) → 可选 AI 看图复核 → 你改一改再存. 本地识图不联网.')
 
     col1, col2 = st.columns([1, 1])
 
@@ -316,32 +318,85 @@ if page == '📷 拍照录入':
             up = st.file_uploader('选图', type=['jpg', 'jpeg', 'png', 'webp'], key='up_pc')
 
         if up:
-            img = Image.open(up)
-            st.image(img, caption='预览', use_container_width=True)
+            # 同一张图只在首次上传时识别一次(换图才重跑), 避免每次交互都重复保存+识别
+            up_sig = f"{up.name}|{up.size}"
+            if st.session_state.get('up_sig') != up_sig:
+                with st.spinner('识图中(会试几种预处理方案, 稍等)…'):
+                    rel_path = save_uploaded_image(up)
+                    abs_path = relative_to_abs(rel_path)
+                    ocr_res = ocr.ocr_image_strong(abs_path)
+                    st.session_state['up_sig'] = up_sig
+                    st.session_state['ocr_res'] = ocr_res
+                    st.session_state['img_rel'] = rel_path
+                    st.session_state.pop('ai_ocr', None)
+                    st.session_state.pop('final_text', None)
 
-            with st.spinner('OCR 识别中...'):
-                rel_path = save_uploaded_image(up)
-                abs_path = relative_to_abs(rel_path)
-                ocr_res = ocr.ocr_image(abs_path)
-                st.session_state['ocr_res'] = ocr_res
-                st.session_state['img_rel'] = rel_path
+            try:
+                img = Image.open(up)
+                st.image(img, caption='预览', use_container_width=True)
+            except Exception as e:
+                st.warning(f'这张图打不开({type(e).__name__}), 多半是 HEIC 格式。请在手机相册里'
+                           '「设置→格式→兼容性最佳」再拍, 或改成 JPG/PNG。识别结果不受影响。')
 
     with col2:
         st.subheader('2. 核对/编辑识别结果')
         ocr_res = st.session_state.get('ocr_res')
+        default_text = ''
         if ocr_res:
             if not ocr_res['success']:
-                st.error(f"OCR 失败: {ocr_res.get('error', '未知')}")
-                st.info('请手动输入题目.')
-                default_text = ''
+                st.error(f"识图失败: {ocr_res.get('error', '未知')}")
+                st.info('可以先手动输入题目, 图片仍会保存.')
+            elif not ocr_res['lines']:
+                st.warning('这张图没识别出文字 — 试试: 拍正一点、光线亮一点、镜头离近一点. 也可以手动输入.')
             else:
-                st.success(f"OCR 成功! 平均置信度 {ocr_res['avg_confidence']:.1%}, 识别 {len(ocr_res['lines'])} 行")
+                st.success(
+                    f"识图完成 · 最佳方案「{ocr_res.get('variant') or '原图'}」"
+                    f"(共试 {ocr_res.get('tried', 1)} 种) · 平均置信度 {ocr_res['avg_confidence']:.1%} "
+                    f"· {len(ocr_res['lines'])} 行"
+                )
                 default_text = ocr_res['text']
-                with st.expander('逐行预览', expanded=False):
+                with st.expander('逐行预览 / 各方案对比', expanded=False):
                     for i, line in enumerate(ocr_res['lines'], 1):
                         st.write(f"{i}. {line}")
-        else:
-            default_text = ''
+                    if ocr_res.get('variants'):
+                        st.caption('—— 各预处理方案得分(取最高者) ——')
+                        for v in ocr_res['variants']:
+                            st.write(f"· {v['name']}: 置信度 {v['avg_confidence']:.1%}, "
+                                     f"{len(v['lines'])} 行, 得分 {v['score']:.3f}")
+                if ocr_res.get('degraded'):
+                    st.caption('⚠️ 图像预处理库不可用, 本次只跑了原图直出(识别质量会差一些).')
+
+        # ====== AI 看图(需配置 Vision Key; 没配就明确说没配, 不假装成功) ======
+        if st.session_state.get('img_rel'):
+            _vs = llm.vision_status()
+            if _vs['enabled']:
+                if st.button('🤖 AI 看图复核(手写题更准)', use_container_width=True):
+                    _abs = relative_to_abs(st.session_state['img_rel'])
+                    with open(_abs, 'rb') as f:
+                        _raw = f.read()
+                    _mime = 'image/png' if _abs.lower().endswith('.png') else 'image/jpeg'
+                    with st.spinner('AI 在看图…'):
+                        _res = llm.read_image(_raw, mime=_mime)
+                    st.session_state['ai_ocr'] = _res
+            else:
+                st.caption(f"🤖 AI 看图未开启({_vs['reason']}) — 现在用的是本地识图.")
+
+            _ai = st.session_state.get('ai_ocr')
+            if _ai:
+                if _ai['success']:
+                    st.text_area('AI 看图结果', value=_ai['text'], height=140, key='ai_ocr_view')
+                    if st.button('✅ 用 AI 的结果(替换题面)', use_container_width=True):
+                        st.session_state['final_text'] = _ai['text']
+                        st.rerun()
+                    if st.button('↩️ 还是用本地识图的结果', use_container_width=True):
+                        st.session_state.pop('final_text', None)
+                        st.rerun()
+                else:
+                    st.error(f"AI 看图失败: {_ai.get('error')}")
+
+        if st.session_state.get('final_text') is not None:
+            default_text = st.session_state['final_text']
+            st.caption('当前题面已切换为 AI 看图结果.')
 
         with st.form('mistake_form'):
             col_a, col_b = st.columns(2)
@@ -431,6 +486,49 @@ elif page == '📖 错题本':
                             st.image(relative_to_abs(m['image_path']), use_container_width=True)
                         except Exception as e:
                             st.error(f'图片加载失败: {e}')
+
+                        # 以前存过的题, 如果当时没认清楚, 可以在这里重新识一次并覆盖题面
+                        _rk = f'reocr_{m["id"]}'
+                        _ca, _cb = st.columns(2)
+                        with _ca:
+                            if st.button('🔍 重新识图(本地)', key=f'rl_{m["id"]}'):
+                                with st.spinner('识图中(多方案择优)…'):
+                                    st.session_state[_rk] = ocr.ocr_image_strong(
+                                        relative_to_abs(m['image_path']))
+                        with _cb:
+                            if llm.is_vision_enabled():
+                                if st.button('🤖 AI 看图重识', key=f'rvi_{m["id"]}'):
+                                    with st.spinner('AI 在看图…'):
+                                        _p = relative_to_abs(m['image_path'])
+                                        with open(_p, 'rb') as _f:
+                                            _raw = _f.read()
+                                        _mime = 'image/png' if _p.lower().endswith('.png') else 'image/jpeg'
+                                        _vr = llm.read_image(_raw, mime=_mime, subject=m['subject'])
+                                        st.session_state[_rk] = {
+                                            'success': _vr['success'],
+                                            'text': _vr['text'],
+                                            'lines': _vr['text'].splitlines(),
+                                            'avg_confidence': 1.0,
+                                            'error': _vr.get('error'),
+                                            'variant': f"AI 看图({_vr.get('model')})",
+                                        }
+                            else:
+                                st.caption('AI 看图未开启')
+
+                        _rr = st.session_state.get(_rk)
+                        if _rr:
+                            if _rr.get('success') and _rr.get('text'):
+                                st.text_area('识别结果', value=_rr['text'], height=120,
+                                             key=f'rk_view_{m["id"]}')
+                                st.caption(f"方案: {_rr.get('variant')}")
+                                if st.button('✅ 用这个结果更新题面', key=f'rk_apply_{m["id"]}'):
+                                    db.update_mistake(m['id'], question=_rr['text'])
+                                    st.session_state.pop(_rk, None)
+                                    st.success('题面已更新')
+                                    time.sleep(0.5)
+                                    st.rerun()
+                            else:
+                                st.error(f"重新识图失败: {_rr.get('error') or '没识别出文字'}")
                     else:
                         st.info('无图片')
 

@@ -49,3 +49,6 @@ test_*.py
 _t*.bat
 *.log
 *.tmp
+
+# 本地测试产生的临时图
+_*.png
