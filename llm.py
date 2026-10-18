@@ -130,6 +130,29 @@ _VISION_VERIFY_PROMPT = """你是"校对员"。下面给你一张题目图片和
 6) 如果草稿已经完全正确, 就原样输出"""
 
 
+def _vision_call(client, **kw):
+    """
+    带限流重试的视觉模型调用.
+    glm-4.6v-flash 等免费模型是时段性共享配额, 高峰会间歇性 429(错误码 1302/1305),
+    官方口径是"等 15 秒以上重试 1-2 次即可". 这事不该让孩子手动做, 程序自动等+重试.
+    """
+    import time as _time
+    waits = (0, 15, 30)  # 首次 + 最多两次重试(等 15s / 30s)
+    last_err = None
+    for i, w in enumerate(waits):
+        if w:
+            _time.sleep(w)
+        try:
+            return client.chat.completions.create(**kw)
+        except Exception as e:
+            msg = str(e)
+            if ('429' in msg or '1302' in msg or '1305' in msg) and i < len(waits) - 1:
+                last_err = e
+                continue
+            raise
+    raise last_err
+
+
 def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通用',
                verify: bool = True) -> dict:
     """
@@ -158,7 +181,8 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
                     "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
         # ---- 第一遍: 抄 ----
-        resp = client.chat.completions.create(
+        resp = _vision_call(
+            client,
             model=VISION_MODEL,
             messages=[
                 {"role": "system", "content": _VISION_PROMPT},
@@ -177,7 +201,8 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
         # ---- 第二遍: 校对(失败不影响结果, 退回第一遍草稿) ----
         if verify:
             try:
-                resp2 = client.chat.completions.create(
+                resp2 = _vision_call(
+                    client,
                     model=VISION_MODEL,
                     messages=[
                         {"role": "system", "content": _VISION_VERIFY_PROMPT},
@@ -240,8 +265,9 @@ def _humanize_error(msg: str) -> str:
                "(DeepSeek 最低充 10 元, 按用量扣费)")
     if '401' in msg or 'Authentication' in msg or 'invalid_api_key' in msg.lower():
         return "API Key 无效或已失效 — 请检查 STUDY_LLM_API_KEY 是否填错/被删除"
-    if '429' in msg:
-        return "调用太频繁或超出当日配额 — 稍等一会儿再试"
+    if '429' in msg or '1302' in msg or '1305' in msg:
+        return ("免费视觉模型限流了(免费档并发少, 高峰时段会间歇性这样) — "
+                "程序已自动等 15-30 秒重试过; 若还是失败, 等 1 分钟再点「再认一次」就好, 不用花钱")
     if '404' in msg:
         return "接口地址或模型名不对 — 请检查 STUDY_LLM_BASE_URL 和 STUDY_LLM_MODEL"
     if 'timeout' in msg.lower():
