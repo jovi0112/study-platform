@@ -16,6 +16,7 @@ import db
 import ocr
 import llm
 import web_search
+import backup
 
 # ============== 路径 ==============
 APP_DIR = os.path.dirname(__file__)
@@ -37,6 +38,11 @@ st.set_page_config(
 
 # 初始化数据库
 db.init_db()
+
+# 云端数据是临时存储(每次重新部署都会被清空), 所以一启动就先把备份里的数据找回来
+_backup_start = backup.startup_sync()
+# 回头再确保备份里有一份最新的(刚配好令牌时, 靠这一步建立第一份备份)
+backup.maybe_push_on_startup()
 
 
 # ============== 工具函数 ==============
@@ -347,6 +353,22 @@ st.sidebar.markdown(f"**AI 老师**: {llm_status} ({llm_info['provider_display']
 _vs = llm.vision_status()
 st.sidebar.markdown(f"**AI 看图**: {'✅ 已启用' if _vs['enabled'] else '⚪ 未开启'}", unsafe_allow_html=True)
 
+# 云端备份: 明说状态, 失败就报失败, 不假装已备份
+_bs = backup.status()
+if not _bs['enabled']:
+    _bk = '⚪ 未开启'
+elif _bs['last_push_ok'] is False:
+    _bk = '⚠️ 备份失败'
+elif _bs['last_push_at']:
+    _bk = f"✅ 已备份 {_bs['last_push_at']}"
+else:
+    _bk = '✅ 待备份'
+st.sidebar.markdown(f"**云端备份**: {_bk}", unsafe_allow_html=True)
+
+# 启动时自动找回的提示(孩子看得懂的版本)
+if _backup_start.get('restored'):
+    st.sidebar.success(f"🔄 已从云端备份找回 {_backup_start['restored']} 条记录")
+
 st.sidebar.divider()
 st.sidebar.caption(f"v0.1 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
@@ -494,6 +516,7 @@ if page == '📷 拍照录入':
                     image_path=img_rel, source='photo' if img_rel else 'typing',
                 )
                 st.success(f'已保存! ID = {kid}. 到"错题本"标签查看.')
+                backup.push_after_change()   # 云端是临时存储, 存一条就往备份送一条
                 st.balloons()
 
 
@@ -619,6 +642,7 @@ elif page == '📖 错题本':
                     note = st.text_input('备注', key=f'n_{m["id"]}')
                     if st.button(f'✅ 标记已复习 #{m["id"]}', key=f'rv_{m["id"]}'):
                         db.mark_reviewed(m['id'], rating, note)
+                        backup.push_after_change()
                         st.success('已记录')
                         time.sleep(0.5)
                         st.rerun()
@@ -639,6 +663,7 @@ elif page == '📖 错题本':
                                           wrong_reason=new_reason,
                                           correct_answer=new_corr or None,
                                           explanation=new_exp or None)
+                        backup.push_after_change()
                         st.success('已更新')
                         time.sleep(0.5)
                         st.rerun()
@@ -661,6 +686,7 @@ elif page == '📖 错题本':
                                 except Exception:
                                     pass  # 图片删不掉不影响条目删除
                             db.delete_mistake(m['id'])
+                            backup.push_after_change(force=True)   # 删除必须立刻同步, 否则会被备份复活
                             st.session_state.pop(_ck, None)
                             st.success('已删除')
                             time.sleep(0.5)
@@ -959,16 +985,68 @@ elif page == '👨‍👩‍👧 家长端':
                 st.markdown(f"- `#{mid}` — {ln}")
 
         st.divider()
-        st.subheader('💾 数据备份与恢复')
-        st.warning(
-            '⚠️ 云端数据是临时存储: 每次更新代码重新部署、或应用重启, 服务器上的本地数据会被清空, '
-            'Streamlit 官方不保留任何快照, 找不回来。建议每周下载一次备份存着。'
-        )
+        st.subheader('☁️ 云端自动备份')
+        _bs = backup.status()
         _cnt = db.count_all()
         st.caption(
             f"当前库: 错题 {_cnt['mistakes']} 条 / 复习记录 {_cnt['reviews']} 条 / "
             f"知识点 {_cnt['knowledge']} 个 / 提示词模板 {_cnt['custom_prompts']} 个 / 愿望 {_cnt['wishes']} 条"
         )
+
+        if not _bs['enabled']:
+            st.error('自动备份未开启 —— 云端数据是临时存储, 一重启就会被清空, 目前只能靠手动下载。')
+            with st.expander('怎么开启(免费, 2 分钟)', expanded=True):
+                st.markdown(
+                    '1. 打开 `https://github.com/settings/tokens` → **Generate new token (classic)**\n'
+                    '2. **只勾选 `gist` 一项**, 有效期选 No expiration, 点生成并复制\n'
+                    '3. 回到本应用 → 右下角 **Settings → Secrets**, 加一行:\n'
+                    '   `STUDY_BACKUP_TOKEN = "粘贴刚才的令牌"`\n'
+                    '4. 保存, 应用自动重启后侧边栏「云端备份」会变成 ✅ 已备份'
+                )
+        else:
+            _ca, _cb = st.columns(2)
+            with _ca:
+                if st.button('☁️ 立即备份', use_container_width=True):
+                    with st.spinner('正在备份到你自己的私有 Gist…'):
+                        _r = backup.push(force=True)
+                    if _r['ok']:
+                        st.success('备份完成')
+                    else:
+                        st.error(_r.get('error') or '备份失败')
+            with _cb:
+                if st.button('🔄 立即找回', use_container_width=True):
+                    with st.spinner('正在从备份找回本地缺的数据…'):
+                        _r2 = backup.pull(force=True)
+                    if _r2['ok']:
+                        if _r2['restored']:
+                            st.success(f"找回 {_r2['restored']} 条")
+                            time.sleep(0.6)
+                            st.rerun()
+                        else:
+                            st.info('备份里没有本地缺的数据, 不用恢复')
+                    else:
+                        st.error(_r2.get('error') or '找回失败')
+
+            _rc = _bs['remote_counts'] or {}
+            _detail = []
+            if _bs['last_push_at']:
+                _detail.append(f"上次备份: {_bs['last_push_at']}")
+            if _rc:
+                _detail.append(f"备份里有 {_rc.get('mistakes', 0)} 条错题")
+            if _bs['last_pull_at']:
+                _detail.append(f"上次找回: {_bs['last_pull_at']}")
+                if _bs['last_pull_restored']:
+                    _detail.append(f"找回 {_bs['last_pull_restored']} 条")
+            if _detail:
+                st.caption(' · '.join(_detail))
+            if _bs['last_push_error']:
+                st.warning(f"上次备份没成功: {_bs['last_push_error']}")
+            if _bs['gist_url']:
+                st.caption(f"备份存放在你账号的私有 Gist: {_bs['gist_url']}")
+
+        st.divider()
+        st.subheader('💾 手动备份(下载到电脑)')
+        st.caption('自动备份之外的另一道保险: 存一份在自己电脑上, 任何时候都能上传恢复。')
         import json as _json
         st.download_button(
             label='📥 下载完整备份(JSON)',
@@ -987,6 +1065,7 @@ elif page == '👨‍👩‍👧 家长端':
                     try:
                         _r = db.import_all(_json.loads(_up.read().decode('utf-8')), merge=_merge)
                         if _r['ok']:
+                            backup.push_after_change()   # 恢复完立刻同步一份, 免得刚恢复又丢
                             st.success(f"导入完成: {_r['imported']}")
                             if any(_r['skipped'].values()):
                                 st.caption(f"跳过(已存在或格式不符): {_r['skipped']}")
