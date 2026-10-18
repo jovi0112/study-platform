@@ -81,9 +81,26 @@ _VISION_PROMPT = """你是"题目抄写员"。请只看图、照抄，不要动�
 6) 输出简体中文正文, 不要 Markdown 代码块。"""
 
 
-def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通用') -> dict:
+_VISION_VERIFY_PROMPT = """你是"校对员"。下面给你一张题目图片和一份从这张图抄出来的草稿。
+
+任务: 把草稿和图片【逐字核对】, 输出修正后的最终题目文字。
+
+核对要点:
+1) 抄错的字、漏掉的字、多出来的字, 一律按图片修正
+2) 数学式子重点核对: 数字、运算符号(× ÷ + -)、分数的分子分母、括号、指数/次数
+3) 页面上不是题目本身的内容(如"班级""姓名""答题纸"这种印刷的表头), 如果草稿里有, 删掉
+4) 分数写成"分子/分母", 乘号用 ×, 除号用 ÷
+5) 只输出修正后的题目文字, 不要解释、不要 Markdown 代码块
+6) 如果草稿已经完全正确, 就原样输出"""
+
+
+def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通用',
+               verify: bool = True) -> dict:
     """
     AI 看图: 把图片交给视觉模型抄出题目原文.
+
+    verify=True 时会做第二遍校对: 把第一遍的草稿和原图逐字核对后再输出最终版.
+    手写题第一遍总会有几个字认岔, 校对一遍能拦掉大部分, 换来的是孩子少手动改.
 
     返回: {'success': bool, 'text': str, 'error': str|None, 'model': str}
     """
@@ -98,14 +115,17 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
         import base64 as _b64
         client = OpenAI(api_key=VISION_API_KEY, base_url=VISION_BASE_URL or None)
         b64 = _b64.b64encode(image_bytes).decode('utf-8')
+        img_part = {"type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"}}
+
+        # ---- 第一遍: 抄 ----
         resp = client.chat.completions.create(
             model=VISION_MODEL,
             messages=[
                 {"role": "system", "content": _VISION_PROMPT},
                 {"role": "user", "content": [
                     {"type": "text", "text": f"学科: {subject}\n请把图里的题目原文抄出来。"},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                    img_part,
                 ]},
             ],
             temperature=0.0,
@@ -114,6 +134,30 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
         text = (resp.choices[0].message.content or '').strip()
         if not text:
             return {'success': False, 'text': '', 'error': '模型返回空内容', 'model': VISION_MODEL}
+
+        # ---- 第二遍: 校对(失败不影响结果, 退回第一遍草稿) ----
+        if verify:
+            try:
+                resp2 = client.chat.completions.create(
+                    model=VISION_MODEL,
+                    messages=[
+                        {"role": "system", "content": _VISION_VERIFY_PROMPT},
+                        {"role": "user", "content": [
+                            {"type": "text",
+                             "text": f"学科: {subject}\n—— 第一遍抄写的草稿 ——\n{text}\n\n"
+                                     "请和原图逐字核对, 输出修正后的最终题目文字。"},
+                            img_part,
+                        ]},
+                    ],
+                    temperature=0.0,
+                    timeout=90,
+                )
+                fixed = (resp2.choices[0].message.content or '').strip()
+                if fixed:
+                    text = fixed
+            except Exception:
+                pass  # 校对挂了不算失败, 用第一遍结果
+
         return {'success': True, 'text': text, 'error': None, 'model': VISION_MODEL}
     except Exception as e:
         return {'success': False, 'text': '', 'error': _humanize_error(str(e)), 'model': VISION_MODEL}

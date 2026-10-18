@@ -9,7 +9,7 @@ import time
 import base64
 import streamlit as st
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ImageOps
 
 # 项目内部模块
 import db
@@ -56,6 +56,39 @@ def relative_to_abs(rel_path: str) -> str:
     if not rel_path:
         return None
     return os.path.join(UPLOAD_DIR, rel_path)
+
+
+def prep_image_for_ai(abs_path: str, max_side: int = 2000, quality: int = 88) -> bytes:
+    """
+    把图片压到视觉模型友好的大小再上传:
+    - 平板/手机原图动辄 3-8MB, 又慢又容易被接口拒收
+    - 2000px + JPEG q88 对"抄题目"来说清晰度绰绰有余
+    处理失败时退回原始字节, 不让识别中断.
+    """
+    try:
+        from io import BytesIO
+        img = Image.open(abs_path)
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+        img = img.convert('RGB')
+        longest = max(img.size)
+        if longest > max_side:
+            s = max_side / longest
+            img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format='JPEG', quality=quality)
+        return buf.getvalue()
+    except Exception:
+        with open(abs_path, 'rb') as f:
+            return f.read()
+
+
+def run_ai_read(abs_path: str, subject: str = '通用') -> dict:
+    """AI 看图统一入口(内部含第二遍校对), 所有页面都走这里"""
+    raw = prep_image_for_ai(abs_path)
+    return llm.read_image(raw, mime='image/jpeg', subject=subject)
 
 
 def tag_pill(text: str, color: str = '#1f77b4'):
@@ -317,19 +350,26 @@ if page == '📷 拍照录入':
         else:
             up = st.file_uploader('选图', type=['jpg', 'jpeg', 'png', 'webp'], key='up_pc')
 
+        # AI 看图开着就自动跑, 孩子不用再多点一步(想省流量可勾掉)
+        if llm.is_vision_enabled():
+            st.checkbox('上传后自动用 AI 看图', value=True, key='ai_auto')
+
         if up:
             # 同一张图只在首次上传时识别一次(换图才重跑), 避免每次交互都重复保存+识别
             up_sig = f"{up.name}|{up.size}"
             if st.session_state.get('up_sig') != up_sig:
-                with st.spinner('识图中(会试几种预处理方案, 稍等)…'):
-                    rel_path = save_uploaded_image(up)
-                    abs_path = relative_to_abs(rel_path)
+                rel_path = save_uploaded_image(up)
+                abs_path = relative_to_abs(rel_path)
+                with st.spinner('本地识图中(会试几种预处理方案, 稍等)…'):
                     ocr_res = ocr.ocr_image_strong(abs_path)
                     st.session_state['up_sig'] = up_sig
                     st.session_state['ocr_res'] = ocr_res
                     st.session_state['img_rel'] = rel_path
                     st.session_state.pop('ai_ocr', None)
                     st.session_state.pop('final_text', None)
+                if llm.is_vision_enabled() and st.session_state.get('ai_auto', True):
+                    with st.spinner('AI 看图中(手写题更准, 会先抄一遍再校对一遍, 约 10-20 秒)…'):
+                        st.session_state['ai_ocr'] = run_ai_read(abs_path)
 
             try:
                 img = Image.open(up)
@@ -341,20 +381,27 @@ if page == '📷 拍照录入':
     with col2:
         st.subheader('2. 核对/编辑识别结果')
         ocr_res = st.session_state.get('ocr_res')
-        default_text = ''
+        _ai = st.session_state.get('ai_ocr')
+        _ai_ok = bool(_ai and _ai.get('success'))
+        local_text = (ocr_res.get('text') or '') if (ocr_res and ocr_res.get('success')) else ''
+        ai_text = (_ai.get('text') or '') if _ai_ok else ''
+        use_local = st.session_state.get('final_text') == 'local'
+
+        # AI 结果可用时默认填 AI 的(它更准), 孩子仍可一键退回本地结果
+        default_text = local_text if (use_local or not _ai_ok) else ai_text
+
         if ocr_res:
             if not ocr_res['success']:
-                st.error(f"识图失败: {ocr_res.get('error', '未知')}")
+                st.error(f"本地识图失败: {ocr_res.get('error', '未知')}")
                 st.info('可以先手动输入题目, 图片仍会保存.')
-            elif not ocr_res['lines']:
-                st.warning('这张图没识别出文字 — 试试: 拍正一点、光线亮一点、镜头离近一点. 也可以手动输入.')
+            elif not local_text:
+                st.warning('本地识图没认出文字 — 试试: 拍正一点、光线亮一点、镜头离近一点.')
             else:
                 st.success(
-                    f"识图完成 · 最佳方案「{ocr_res.get('variant') or '原图'}」"
+                    f"本地识图完成 · 最佳方案「{ocr_res.get('variant') or '原图'}」"
                     f"(共试 {ocr_res.get('tried', 1)} 种) · 平均置信度 {ocr_res['avg_confidence']:.1%} "
                     f"· {len(ocr_res['lines'])} 行"
                 )
-                default_text = ocr_res['text']
                 with st.expander('逐行预览 / 各方案对比', expanded=False):
                     for i, line in enumerate(ocr_res['lines'], 1):
                         st.write(f"{i}. {line}")
@@ -366,37 +413,31 @@ if page == '📷 拍照录入':
                 if ocr_res.get('degraded'):
                     st.caption('⚠️ 图像预处理库不可用, 本次只跑了原图直出(识别质量会差一些).')
 
-        # ====== AI 看图(需配置 Vision Key; 没配就明确说没配, 不假装成功) ======
+        # ====== AI 看图: 开着就自动跑, 这里只负责展示结果和切换 ======
         if st.session_state.get('img_rel'):
             _vs = llm.vision_status()
             if _vs['enabled']:
-                if st.button('🤖 AI 看图复核(手写题更准)', use_container_width=True):
-                    _abs = relative_to_abs(st.session_state['img_rel'])
-                    with open(_abs, 'rb') as f:
-                        _raw = f.read()
-                    _mime = 'image/png' if _abs.lower().endswith('.png') else 'image/jpeg'
+                if _ai_ok:
+                    if use_local:
+                        st.info('当前题面用的是**本地识图**结果')
+                        if st.button('🤖 改用 AI 看图的结果', use_container_width=True):
+                            st.session_state['final_text'] = 'ai'
+                            st.rerun()
+                    else:
+                        st.success(f"🤖 AI 看图完成({_ai.get('model')}) — 已自动填入下方题面, 保存前扫一眼")
+                        if st.button('↩️ AI 认错了? 改用本地识图结果', use_container_width=True):
+                            st.session_state['final_text'] = 'local'
+                            st.rerun()
+                elif _ai:
+                    st.error(f"AI 看图失败: {_ai.get('error')}")
+                if st.button('🔁 再认一次(重新看图)', use_container_width=True):
                     with st.spinner('AI 在看图…'):
-                        _res = llm.read_image(_raw, mime=_mime)
-                    st.session_state['ai_ocr'] = _res
+                        st.session_state['ai_ocr'] = run_ai_read(
+                            relative_to_abs(st.session_state['img_rel']))
+                    st.session_state.pop('final_text', None)
+                    st.rerun()
             else:
                 st.caption(f"🤖 AI 看图未开启({_vs['reason']}) — 现在用的是本地识图.")
-
-            _ai = st.session_state.get('ai_ocr')
-            if _ai:
-                if _ai['success']:
-                    st.text_area('AI 看图结果', value=_ai['text'], height=140, key='ai_ocr_view')
-                    if st.button('✅ 用 AI 的结果(替换题面)', use_container_width=True):
-                        st.session_state['final_text'] = _ai['text']
-                        st.rerun()
-                    if st.button('↩️ 还是用本地识图的结果', use_container_width=True):
-                        st.session_state.pop('final_text', None)
-                        st.rerun()
-                else:
-                    st.error(f"AI 看图失败: {_ai.get('error')}")
-
-        if st.session_state.get('final_text') is not None:
-            default_text = st.session_state['final_text']
-            st.caption('当前题面已切换为 AI 看图结果.')
 
         with st.form('mistake_form'):
             col_a, col_b = st.columns(2)
@@ -498,12 +539,9 @@ elif page == '📖 错题本':
                         with _cb:
                             if llm.is_vision_enabled():
                                 if st.button('🤖 AI 看图重识', key=f'rvi_{m["id"]}'):
-                                    with st.spinner('AI 在看图…'):
-                                        _p = relative_to_abs(m['image_path'])
-                                        with open(_p, 'rb') as _f:
-                                            _raw = _f.read()
-                                        _mime = 'image/png' if _p.lower().endswith('.png') else 'image/jpeg'
-                                        _vr = llm.read_image(_raw, mime=_mime, subject=m['subject'])
+                                    with st.spinner('AI 在看图(先抄一遍再校对一遍)…'):
+                                        _vr = run_ai_read(relative_to_abs(m['image_path']),
+                                                          subject=m['subject'])
                                         st.session_state[_rk] = {
                                             'success': _vr['success'],
                                             'text': _vr['text'],
