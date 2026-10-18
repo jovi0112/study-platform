@@ -28,17 +28,49 @@ def _read_secret(key: str, default: str = '') -> str:
 
 
 # ============== 配置区 ==============
-LLM_PROVIDER = _read_secret('STUDY_LLM_PROVIDER', 'offline')  # offline / openai / deepseek / qwen
-LLM_API_KEY = _read_secret('STUDY_LLM_API_KEY', '')
-LLM_BASE_URL = _read_secret('STUDY_LLM_BASE_URL', '')
-LLM_MODEL = _read_secret('STUDY_LLM_MODEL', '')
+def _clean_secret(key: str, default: str = '') -> str:
+    """
+    读配置 + 自动清洗: 去首尾空白、剥掉误粘贴的引号(中英文)、去零宽字符/全角空格.
+    真实案例: 在云端 Secrets 复制 Key 时带上了中文引号, 请求头编码直接炸出
+    UnicodeEncodeError('ascii' codec ...), 而且报错原文完全看不出是 Key 的问题.
+    """
+    val = _read_secret(key, default)
+    if not val:
+        return val
+    # 去掉首尾的各种引号(可能粘贴时连外面的引号一起复制了)
+    val = val.strip().strip('"\'“”‘’「」『』《》')
+    # 正文中间的不可见字符/全角空白也一并清掉
+    for ch in ('\u200b', '\u200c', '\u200d', '\ufeff', '\u00a0', '\u3000'):
+        val = val.replace(ch, '')
+    return val.strip()
+
+
+LLM_PROVIDER = _clean_secret('STUDY_LLM_PROVIDER', 'offline')  # offline / openai / deepseek / qwen
+LLM_API_KEY = _clean_secret('STUDY_LLM_API_KEY', '')
+LLM_BASE_URL = _clean_secret('STUDY_LLM_BASE_URL', '')
+LLM_MODEL = _clean_secret('STUDY_LLM_MODEL', '')
 
 # ---- 看图(Vision): 与讲题分开配置, 互不干扰 ----
 # 讲题用 DeepSeek(纯文本) 完全够用; 看图必须换一个"带眼睛"的模型.
 # 可选: 通义 qwen-vl-max / 智谱 glm-4v-flash / 硅基流动 Qwen2.5-VL / OpenAI gpt-4o-mini
-VISION_API_KEY = _read_secret('STUDY_VISION_API_KEY', '')
-VISION_BASE_URL = _read_secret('STUDY_VISION_BASE_URL', '')
-VISION_MODEL = _read_secret('STUDY_VISION_MODEL', '')
+VISION_API_KEY = _clean_secret('STUDY_VISION_API_KEY', '')
+VISION_BASE_URL = _clean_secret('STUDY_VISION_BASE_URL', '')
+VISION_MODEL = _clean_secret('STUDY_VISION_MODEL', '')
+
+
+def _non_ascii_cfg_problem() -> str:
+    """
+    检查视觉配置里是否仍有非英文字符(自动清洗救不回来的, 比如中间夹了汉字).
+    返回人话问题描述; 没问题返回空串.
+    """
+    for name, val in (('STUDY_VISION_API_KEY', VISION_API_KEY),
+                      ('STUDY_VISION_BASE_URL', VISION_BASE_URL),
+                      ('STUDY_VISION_MODEL', VISION_MODEL)):
+        if val and not val.isascii():
+            return (f"{name} 里混入了非英文字符(多半是复制时带上了中文引号/汉字/全角空格)。"
+                    "请到 Streamlit Cloud 的 Secrets 把这一行删掉重新粘贴, "
+                    "值里只能有英文、数字、短横线和点。")
+    return ''
 
 
 def is_llm_enabled() -> bool:
@@ -60,6 +92,10 @@ def vision_status() -> dict:
     if 'deepseek' in VISION_BASE_URL.lower():
         return {'enabled': False,
                 'reason': 'DeepSeek 不支持看图, 请换成通义/智谱/OpenAI/硅基流动等视觉模型',
+                'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
+    bad = _non_ascii_cfg_problem()
+    if bad:
+        return {'enabled': False, 'reason': bad,
                 'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
     return {'enabled': True, 'reason': '已启用', 'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
 
@@ -110,6 +146,9 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
                 'model': stt['model']}
     if not image_bytes:
         return {'success': False, 'text': '', 'error': '图片为空', 'model': stt['model']}
+    bad = _non_ascii_cfg_problem()
+    if bad:
+        return {'success': False, 'text': '', 'error': bad, 'model': stt['model']}
     try:
         from openai import OpenAI
         import base64 as _b64
@@ -192,6 +231,10 @@ def _default_model():
 
 def _humanize_error(msg: str) -> str:
     """把 LLM 原始异常翻译成人话"""
+    if 'ascii' in msg and 'codec' in msg:
+        return ("请求里混入了非英文字符, 发不出去 — 多半是 Key/接口地址复制时带上了"
+                "中文引号或全角空格。请到 Secrets 检查 STUDY_VISION_* 的值, "
+                "只保留英文/数字/短横线。")
     if '402' in msg or 'Insufficient Balance' in msg:
         return ("服务商账户余额不足 — 请到 platform.deepseek.com 充值后再试 "
                "(DeepSeek 最低充 10 元, 按用量扣费)")
