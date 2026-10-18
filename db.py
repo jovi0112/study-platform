@@ -334,6 +334,64 @@ def list_recent_good_prompts(limit: int = 20) -> list:
     return out[:limit]
 
 
+# ============== 备份 / 恢复 ==============
+# 原因: Streamlit Community Cloud 的文件系统是临时存储, 应用重启/重新部署会清空本地库
+# 且不保留任何快照。所以"能导出 + 能导回来"是这套系统的保命绳。
+_BACKUP_TABLES = ('mistakes', 'reviews', 'knowledge', 'wishes', 'custom_prompts', 'settings')
+
+
+def export_all() -> dict:
+    """整库导出(错题 + 复习记录 + 知识点 + 愿望 + 提示词模板 + 设置)"""
+    out = {'version': 1, 'exported_at': datetime.now().isoformat(), 'tables': {}}
+    with get_conn() as conn:
+        for t in _BACKUP_TABLES:
+            out['tables'][t] = [dict(r) for r in conn.execute(f'SELECT * FROM {t}').fetchall()]
+    return out
+
+
+def count_all() -> dict:
+    """各表条数, 给家长端"当前库有多少东西"用"""
+    with get_conn() as conn:
+        return {t: conn.execute(f'SELECT COUNT(*) AS c FROM {t}').fetchone()['c']
+                for t in _BACKUP_TABLES}
+
+
+def import_all(payload: dict, merge: bool = True) -> dict:
+    """
+    从备份恢复.
+    merge=True : 跳过已存在的编号, 不覆盖现有内容(推荐, 用来找回丢失的题)
+    merge=False: 先清空各表再全量导入(用来整体还原)
+    返回 {'ok': bool, 'imported': {表: 条数}, 'skipped': {表: 条数}, 'error': str|None}
+    """
+    if not isinstance(payload, dict) or 'tables' not in payload:
+        return {'ok': False, 'imported': {}, 'skipped': {}, 'error': '文件格式不对(里面没有 tables)'}
+    res = {'ok': True, 'imported': {}, 'skipped': {}, 'error': None}
+    with get_conn() as conn:
+        for t, rows in payload.get('tables', {}).items():
+            if t not in _BACKUP_TABLES or not rows:
+                continue
+            if not merge:
+                conn.execute(f'DELETE FROM {t}')
+            imported = skipped = 0
+            for row in rows:
+                cols = ','.join(row.keys())
+                ph = ','.join(['?'] * len(row))
+                try:
+                    sql = (f'INSERT OR IGNORE INTO {t} ({cols}) VALUES ({ph})' if merge
+                           else f'INSERT INTO {t} ({cols}) VALUES ({ph})')
+                    cur = conn.execute(sql, list(row.values()))
+                    if cur.rowcount and cur.rowcount > 0:
+                        imported += 1
+                    else:
+                        skipped += 1
+                except Exception:
+                    skipped += 1
+            if imported or skipped:
+                res['imported'][t] = imported
+                res['skipped'][t] = skipped
+    return res
+
+
 # ============== 家长端 ==============
 def get_setting(key, default=None):
     with get_conn() as conn:

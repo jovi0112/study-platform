@@ -40,6 +40,22 @@ db.init_db()
 
 
 # ============== 工具函数 ==============
+def fmt_when(iso) -> str:
+    """把 ISO 时间说成孩子看得懂的话: 今天 14:32 / 昨天 20:10 / 10-12 09:05"""
+    if not iso:
+        return '未知时间'
+    try:
+        dt = datetime.fromisoformat(str(iso))
+    except Exception:
+        return str(iso)[:16]
+    now = datetime.now()
+    if dt.date() == now.date():
+        return f'今天 {dt:%H:%M}'
+    if (now.date() - dt.date()).days == 1:
+        return f'昨天 {dt:%H:%M}'
+    return f'{dt:%m-%d %H:%M}'
+
+
 def save_uploaded_image(uploaded_file) -> str:
     """保存上传图片到 uploads/, 返回相对路径"""
     if uploaded_file is None:
@@ -505,7 +521,8 @@ elif page == '📖 错题本':
         st.caption(f'共 {len(items)} 条')
         for m in items:
             with st.expander(
-                f"#{m['id']} [{m['subject']}] {m.get('title') or m['question'][:40]} "
+                f"#{m['id']} [{m['subject']}] 📅{fmt_when(m['created_at'])} "
+                f"{m.get('title') or m['question'][:40]} "
                 f"{'✅ 已掌握' if m['mastered'] else '⚠️ ' + (m.get('wrong_reason') or '未掌握')}"
             ):
                 tabs = st.tabs(['题目', '图片', 'AI 讲题', '搜题', '复习记录', '操作'])
@@ -519,7 +536,10 @@ elif page == '📖 错题本':
                         st.markdown(f"**正确答案**: {m['correct_answer']}")
                     if m.get('explanation'):
                         st.markdown(f"**解答**: {m['explanation']}")
-                    st.caption(f"录入: {m['created_at']} | 来源: {m.get('source') or '手动'}")
+                    st.caption(f"📅 录入于 {fmt_when(m['created_at'])}"
+                               f" | 来源: {m.get('source') or '手动'}"
+                               f" | 已复习 {m['review_count']} 次"
+                               f" | 上次复习 {fmt_when(m.get('last_reviewed')) if m.get('last_reviewed') else '还没复习过'}")
 
                 with tabs[1]:
                     if m.get('image_path'):
@@ -672,7 +692,7 @@ elif page == '🔁 复习计划':
                 with c1:
                     st.markdown(f"{color} **#{m['id']}** [{m['subject']}] {m.get('title') or m['question'][:50]}")
                 with c2:
-                    st.caption(f'超期 {overdue} 天')
+                    st.caption(f'超期 {overdue} 天 · 录入 {fmt_when(m["created_at"])}')
                 with c3:
                     if st.button(f'去复习', key=f'go_{m["id"]}'):
                         st.session_state['jump_mistake'] = m['id']
@@ -939,17 +959,43 @@ elif page == '👨‍👩‍👧 家长端':
                 st.markdown(f"- `#{mid}` — {ln}")
 
         st.divider()
-        st.subheader('数据导出')
-        if st.button('📥 导出全部错题为 JSON'):
-            all_items = db.list_mistakes(limit=10000)
-            import json as _json
-            payload = _json.dumps(all_items, ensure_ascii=False, indent=2)
-            st.download_button(
-                label='下载',
-                data=payload,
-                file_name=f"study_export_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-                mime='application/json',
-            )
+        st.subheader('💾 数据备份与恢复')
+        st.warning(
+            '⚠️ 云端数据是临时存储: 每次更新代码重新部署、或应用重启, 服务器上的本地数据会被清空, '
+            'Streamlit 官方不保留任何快照, 找不回来。建议每周下载一次备份存着。'
+        )
+        _cnt = db.count_all()
+        st.caption(
+            f"当前库: 错题 {_cnt['mistakes']} 条 / 复习记录 {_cnt['reviews']} 条 / "
+            f"知识点 {_cnt['knowledge']} 个 / 提示词模板 {_cnt['custom_prompts']} 个 / 愿望 {_cnt['wishes']} 条"
+        )
+        import json as _json
+        st.download_button(
+            label='📥 下载完整备份(JSON)',
+            data=_json.dumps(db.export_all(), ensure_ascii=False, indent=2),
+            file_name=f"study_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime='application/json',
+            use_container_width=True,
+        )
+        with st.expander('♻️ 从备份文件恢复', expanded=False):
+            _up = st.file_uploader('选择之前下载的备份 JSON', type=['json'], key='restore_up')
+            _merge = st.checkbox('合并导入(跳过已存在的编号, 不覆盖现有内容)', value=True,
+                                 key='restore_merge')
+            if _up is not None:
+                st.caption(f'待导入文件: {_up.name} ({_up.size / 1024:.1f} KB)')
+                if st.button('开始恢复', type='primary', key='restore_go'):
+                    try:
+                        _r = db.import_all(_json.loads(_up.read().decode('utf-8')), merge=_merge)
+                        if _r['ok']:
+                            st.success(f"导入完成: {_r['imported']}")
+                            if any(_r['skipped'].values()):
+                                st.caption(f"跳过(已存在或格式不符): {_r['skipped']}")
+                            time.sleep(0.8)
+                            st.rerun()
+                        else:
+                            st.error(_r['error'])
+                    except Exception as _e:
+                        st.error(f'恢复失败: {_e}')
 
         st.divider()
         st.subheader('⚠️ 危险操作')
