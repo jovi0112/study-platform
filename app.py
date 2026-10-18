@@ -987,11 +987,15 @@ elif page == '👨‍👩‍👧 家长端':
         st.divider()
         st.subheader('☁️ 云端自动备份')
         _bs = backup.status()
-        _cnt = db.count_all()
-        st.caption(
-            f"当前库: 错题 {_cnt['mistakes']} 条 / 复习记录 {_cnt['reviews']} 条 / "
-            f"知识点 {_cnt['knowledge']} 个 / 提示词模板 {_cnt['custom_prompts']} 个 / 愿望 {_cnt['wishes']} 条"
-        )
+        # 防御: 部署切换瞬间进程里可能还是旧 db 模块(没有 count_all), 别让过渡态把整页崩掉
+        try:
+            _cnt = db.count_all()
+            st.caption(
+                f"当前库: 错题 {_cnt['mistakes']} 条 / 复习记录 {_cnt['reviews']} 条 / "
+                f"知识点 {_cnt['knowledge']} 个 / 提示词模板 {_cnt['custom_prompts']} 个 / 愿望 {_cnt['wishes']} 条"
+            )
+        except AttributeError:
+            st.caption('当前库: 条数统计暂不可用(应用刚更新, 重启一次即恢复)')
 
         if not _bs['enabled']:
             st.error('自动备份未开启 —— 云端数据是临时存储, 一重启就会被清空, 目前只能靠手动下载。')
