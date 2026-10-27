@@ -28,7 +28,7 @@ CALENDAR_PATH = os.path.join(DATA_DIR, 'quiz_calendar.json')
 # 于是会出现"主脚本已经是新版、进程里的 quiz 还是旧对象"的错位,
 # 表现为 AttributeError: module 'quiz' has no attribute 'phase_options' 整页崩。
 # 加了这个号, 页面能明确说出"是后台旧模块, 不是代码坏了", 并降级显示。
-MODULE_VER = 2
+MODULE_VER = 4
 
 SUBJECTS = ['数学', '英语', '语文']
 BANK_FILES = {
@@ -131,10 +131,22 @@ def init_quiz_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     with _conn() as conn:
         conn.executescript(QUIZ_SCHEMA)
-        # 兼容旧库: 讲解图的结构存在这里, 已生成过的不再重复调 AI
+        # 兼容旧库: 字段不存在则追加, 老用户升级不会炸
         cols = {r[1] for r in conn.execute('PRAGMA table_info(quiz_items)')}
-        if 'diagram_json' not in cols:
-            conn.execute('ALTER TABLE quiz_items ADD COLUMN diagram_json TEXT')
+        for col, ddl in (('diagram_json', 'TEXT'),     # 讲解图结构, 已生成的不再重复调 AI
+                         ('passage', 'TEXT'),          # 阅读题原文
+                         ('points_json', 'TEXT'),      # 主观题评分点
+                         ('hits_json', 'TEXT'),        # 判卷结果: 每个要点答到没有
+                         ('unanswered', 'INTEGER DEFAULT 0'),   # 交卷时这题空着没写
+                         ('miss_reason', 'TEXT')):     # 没写的原因: timeout / blank
+            if col not in cols:
+                conn.execute(f'ALTER TABLE quiz_items ADD COLUMN {col} {ddl}')
+        pcols = {r[1] for r in conn.execute('PRAGMA table_info(quiz_papers)')}
+        for col, ddl in (('limit_sec', 'INTEGER'),      # 本卷限时多少秒(0/空 = 不限时)
+                         ('deadline', 'TEXT'),          # 到点时刻 ISO
+                         ('close_reason', 'TEXT')):     # 怎么结束的: manual / timeout
+            if col not in pcols:
+                conn.execute(f'ALTER TABLE quiz_papers ADD COLUMN {col} {ddl}')
 
 
 # ============== 教学日历 ==============
@@ -389,17 +401,56 @@ def _seed_bank(subject: str) -> list:
             'subject': subject,
             'chapter': q.get('chapter', ''),
             'topic': q.get('topic', ''),
+            'lesson': q.get('lesson', ''),        # 课文名, 用来和教学进度对上(阅读题靠它进当前进度段)
             'qtype': q.get('type', 'fill'),
             'difficulty': int(q.get('difficulty', 3)),
             'stem': q.get('stem', ''),
+            'passage': q.get('passage', ''),      # 阅读题原文节选: 没课本也做得了
             'options': q.get('options'),
             'answer': str(q.get('answer', '')),
             'alt': q.get('alt', []) or [],
+            'points': _norm_points(q.get('points')),   # 主观题评分点 [{no,text,w}]
             'explain': q.get('explain', ''),
             'source': 'seed',
             'verified': True,
         })
     return out
+
+
+def _norm_points(raw) -> list:
+    """评分点统一成 [{'no':..,'text':..,'w':..}]。AI 给的脏数据在这里挡掉。"""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for i, p in enumerate(raw[:8]):
+        if isinstance(p, dict):
+            t = str(p.get('text') or p.get('point') or '').strip()
+            if not t:
+                continue
+            try:
+                w = float(p.get('w', 1) or 1)
+            except (TypeError, ValueError):
+                w = 1.0
+            out.append({'no': str(p.get('no') or ('①②③④⑤⑥⑦⑧'[i] if i < 8 else str(i + 1))),
+                        'text': t[:120], 'w': max(0.5, min(w, 3.0))})
+        elif isinstance(p, str) and p.strip():
+            out.append({'no': '①②③④⑤⑥⑦⑧'[i] if i < 8 else str(i + 1),
+                        'text': p.strip()[:120], 'w': 1.0})
+    return out
+
+
+def in_phase(q: dict, topics: list) -> bool:
+    """
+    这道题算不算"当前进度段"。
+    阅读题的 topic 是'现代文阅读'(按题型归类), 光靠它永远匹配不到进度里的课文名,
+    必须再认 lesson。以前漏了这一步, 结果阅读题只能当跨章节复习题出现 —— 这是真 bug。
+    """
+    if not topics:
+        return True
+    for key in (q.get('topic'), q.get('chapter'), q.get('lesson')):
+        if key and key in topics:
+            return True
+    return False
 
 
 def _ai_bank(subject: str, verified_only: bool = True) -> list:
@@ -439,7 +490,7 @@ def scope_stats(subject: str, on: date = None) -> dict:
     if not ph:
         return {'in_scope': 0, 'bank': len(bank), 'types': {}, 'phase': None}
     topics = ph.get('topics', [])
-    in_scope = [q for q in bank if q['topic'] in topics or q['chapter'] in topics]
+    in_scope = [q for q in bank if in_phase(q, topics)]
     types = {}
     for q in in_scope:
         k = q.get('qtype') or 'fill'
@@ -684,6 +735,14 @@ def _as_number(s):
             return None
 
 
+def choice_letter(text) -> str:
+    """把界面上的一整条选项 "C. -2ab" 收成字母 "C"。存库/判分都先过一遍, 库里的答案才干净。
+    不是「字母+分隔符」开头的原样返回, 所以填空题、简答题不受影响。"""
+    s = str(text or '').strip()
+    m = re.match(r'^[（(]?([A-Ha-h])[）)]?\s*[.、,，:：）)]\s*', s)
+    return m.group(1).upper() if m else s
+
+
 def is_correct(q: dict, user_answer) -> bool:
     qt = (q.get('qtype') or q.get('type') or '').lower()
     ans_raw = q.get('answer')
@@ -717,6 +776,23 @@ def is_correct(q: dict, user_answer) -> bool:
     ans = normalize(ans_raw)
     if ua == ans:
         return True
+
+    # ---- 选项字母: 标准答案是 "C", 孩子点的是界面上那条完整选项 "C. -2ab" ----
+    # 界面上选择题渲染的是「字母. 选项内容」整条文字, 直接比较字符串会把对的判成错的。
+    # 这里统一把 "C. -2ab" / "C、-2ab" / "(C)" / "-2ab" 都认成 C。
+    if re.fullmatch(r'[A-Ha-h]', ans):
+        key = ans.upper()
+        ua_s = ua.strip()
+        if re.fullmatch(r'[（(]?[A-Ha-h][）)]?', ua_s):
+            if ua_s.strip('（）()').upper() == key:
+                return True
+        _mo = re.match(r'^[（(]?([A-Ha-h])[）)]?\s*[.、,，:：）)]\s*(.*)$', ua_s, re.S)
+        if _mo and _mo.group(1).upper() == key:
+            _rest = _mo.group(2).strip()
+            _opt = (q.get('options') or {}).get(key)
+            # 只写了字母 / 跟的正是这个选项的内容 -> 算对
+            if not _rest or not _opt or normalize(_rest) == normalize(_opt):
+                return True
     # 大小写容错: 英语单词(Library/library)、选项字母(b/B)
     if ua.lower() == ans.lower() and re.search(r'[A-Za-z]', ans):
         return True
@@ -734,20 +810,132 @@ def is_correct(q: dict, user_answer) -> bool:
     return False
 
 
-def ai_grade(subject: str, stem: str, ref_answer: str, user_answer: str, full_score: int = 10) -> dict:
-    """主观题 AI 参考评分. 明示这是参考分, 需家长确认"""
+# 主观题按要点算"覆盖率", 达到这个比例才算真的掌握了(以前是 6 分及格线, 太松)
+POINT_PASS_LINE = 0.6
+
+
+def _key_terms(text: str) -> list:
+    """把一句话拆成可比较的词(不用分词库, 取 2~4 字的中文片段)。用于本地粗判要点。"""
+    import re as _re
+    out = []
+    for seg in _re.split(r'[，,。；;、：:！!？?（）()\s"“”]+', str(text or '')):
+        seg = seg.strip()
+        if len(seg) >= 2:
+            for i in range(0, max(1, len(seg) - 1)):
+                out.append(seg[i:i + 2])
+    return out
+
+
+def local_point_hits(points: list, user_answer: str) -> list:
+    """
+    AI 不可用时的兜底: 用每个要点的关键词有没有出现在孩子的答案里, 粗判命中。
+    只能当参考 —— 结果一律标 by='local', 页面上会写明"本地粗判, 请家长确认"。
+
+    要点之间共同的词(比如两条要点都含"的说法")不能用来区分, 先剔掉;
+    否则孩子只答了一条, 另一条会被共享词蹭成"也答到了"。
+    """
+    ans = str(user_answer or '')
+    if not ans.strip():
+        return [False] * len(points)
+    all_terms = [set(_key_terms(p.get('text', ''))) for p in points]
+    common = set()
+    if len(all_terms) >= 2:
+        from collections import Counter
+        cnt = Counter(t for s in all_terms for t in s)
+        common = {t for t, n in cnt.items() if n >= 2}
+    hits = []
+    for terms in all_terms:
+        key = [t for t in terms if t not in common] or list(terms)
+        if not key:
+            hits.append(False)
+            continue
+        hit = sum(1 for t in key if t in ans)
+        hits.append(hit / len(key) >= 0.45)
+    return hits
+
+
+def coverage_of(points: list, hits: list) -> float:
+    """加权覆盖率。没有要点时返回 None(表示不适用)。"""
+    pts = points or []
+    if not pts:
+        return None
+    tot = sum(float(p.get('w', 1) or 1) for p in pts)
+    if tot <= 0:
+        return None
+    got = sum(float(p.get('w', 1) or 1) for p, h in zip(pts, hits) if h)
+    return round(got / tot, 3)
+
+
+def ai_grade(subject: str, stem: str, ref_answer: str, user_answer: str, full_score: int = 10,
+             points: list = None) -> dict:
+    """
+    主观题评分。
+    - 有评分点(points): AI 逐条判每条要点答到没有, 算加权覆盖率; 覆盖率 >= 60% 才算对。
+      返回带 'hits' 明细, 讲解图要用它标"这条你写了 / 这条漏了"。
+    - 没有评分点: 退回老口径(0~10 分, >=6 算对)。
+    一律明示这是参考分, 需家长确认。
+    """
     import llm
+    points = _norm_points(points)
+    blank = not str(user_answer or '').strip()
+    if blank:
+        return {'ok': True, 'score': 0, 'coverage': 0.0 if points else None,
+                'hits': [False] * len(points), 'by': 'exact',
+                'comment': '没有作答, 记 0 分。参考要点: ' + str(ref_answer)[:200]}
     if not llm.is_llm_enabled():
-        return {'ok': False, 'score': None, 'comment': 'AI 老师未配置, 这题需要家长手动批改'}
-    if not str(user_answer or '').strip():
-        return {'ok': True, 'score': 0, 'comment': '没有作答, 记 0 分。参考要点: ' + str(ref_answer)[:200]}
+        if points:
+            hits = local_point_hits(points, user_answer)
+            cov = coverage_of(points, hits)
+            return {'ok': False, 'score': round((cov or 0) * full_score, 1), 'coverage': cov,
+                    'hits': hits, 'by': 'local',
+                    'comment': 'AI 老师未配置, 这是本地按关键词粗判的参考结果, 请家长对照要点确认。'}
+        return {'ok': False, 'score': None, 'coverage': None, 'hits': [], 'by': 'parent',
+                'comment': 'AI 老师未配置, 这题需要家长手动批改'}
+
+    if points:
+        plist = '\n'.join(f"{p['no']} {p['text']}" for p in points)
+        system = ('你是北京市初中语文阅卷老师。下面这道题给了若干个评分要点, 你要逐条判断'
+                  '学生答案里有没有答到。只认意思, 不要求字句相同; 学生用自己的话说到了就算答到。'
+                  '输出严格 JSON: {"hits":[每条要点 1=答到 0=漏掉, 顺序与要点一致], "advice":"一句话建议"}')
+        user = (f"科目: {subject}\n题目: {stem}\n评分要点:\n{plist}\n\n学生答案: {user_answer}\n"
+                f"请按顺序输出 hits 数组(长度 {len(points)})。")
+        res = llm._call_chat(system, user, json_mode=True)
+        if res.get('error'):
+            hits = local_point_hits(points, user_answer)
+            return {'ok': False, 'score': round(coverage_of(points, hits) * full_score, 1),
+                    'coverage': coverage_of(points, hits), 'hits': hits, 'by': 'local',
+                    'comment': f'评分失败({res["error"]}), 这是本地粗判的参考结果, 请家长确认。'}
+        raw_hits = res.get('hits')
+        hits = []
+        if isinstance(raw_hits, list):
+            for i in range(len(points)):
+                v = raw_hits[i] if i < len(raw_hits) else 0
+                hits.append(str(v).strip() in ('1', 'true', 'True', '是', '对'))
+        if len(hits) != len(points) or not any(hits):
+            # AI 返回长度不对或全 0 且答案非空 -> 用本地粗判兜底, 别直接判 0 分冤枉孩子
+            if len(hits) != len(points):
+                hits = local_point_hits(points, user_answer)
+        cov = coverage_of(points, hits)
+        got = [p['no'] for p, h in zip(points, hits) if h]
+        miss = [p['no'] for p, h in zip(points, hits) if not h]
+        cmt = []
+        if got:
+            cmt.append('答到了: ' + ''.join(got))
+        if miss:
+            cmt.append('漏了: ' + ''.join(miss))
+        if res.get('advice'):
+            cmt.append('建议: ' + str(res['advice']))
+        return {'ok': True, 'score': round((cov or 0) * full_score, 1), 'coverage': cov,
+                'hits': hits, 'by': 'ai', 'comment': '　'.join(cmt) or '暂无评语'}
+
     system = ('你是北京市初中阅卷老师, 按要点给分。输出严格 JSON: '
               '{"score":0-10, "hit":["答对的要点"], "miss":["漏掉的要点"], "advice":"给孩子的改进建议"}')
     user = (f"科目: {subject}\n题目: {stem}\n参考答案要点: {ref_answer}\n"
             f"学生答案: {user_answer}\n满分 {full_score} 分, 按要点给分, 不要因为表述不同扣分。")
     res = llm._call_chat(system, user, json_mode=True)
     if res.get('error'):
-        return {'ok': False, 'score': None, 'comment': f'评分失败: {res["error"]}'}
+        return {'ok': False, 'score': None, 'coverage': None, 'hits': [], 'by': 'parent',
+                'comment': f'评分失败: {res["error"]}'}
     try:
         score = float(res.get('score', 0))
     except (TypeError, ValueError):
@@ -759,7 +947,8 @@ def ai_grade(subject: str, stem: str, ref_answer: str, user_answer: str, full_sc
         comment.append('漏了: ' + '；'.join(map(str, res['miss'])))
     if res.get('advice'):
         comment.append('建议: ' + str(res['advice']))
-    return {'ok': True, 'score': round(score, 1), 'comment': '　'.join(comment) or '暂无评语'}
+    return {'ok': True, 'score': round(score, 1), 'coverage': None, 'hits': [], 'by': 'ai',
+            'comment': '　'.join(comment) or '暂无评语'}
 
 
 # ============== 组卷 ==============
@@ -840,7 +1029,7 @@ def pick_questions(subject: str, n: int = 10, on: date = None, use_ai: bool = Tr
     bank = all_bank(subject)
 
     # 1) 当前进度范围内的题
-    in_scope = [q for q in bank if q['topic'] in topics or q['chapter'] in topics]
+    in_scope = [q for q in bank if in_phase(q, topics)]
     seen = _recent_uids(subject)
 
     # 2) 题型轮转 + 难度阶梯。优先只用"没做过"的题, 做完才回头重复
@@ -964,27 +1153,104 @@ def recent_wrong_topics(subject: str, limit: int = 3) -> list:
 
 
 # ============== 试卷落库 / 交卷 / 报告 ==============
-def create_paper(subject: str, questions: list, phase_label: str = '', target_level: int = 3) -> int:
+# ============== 限时 ==============
+# 按题量定时间: 孩子做题不像大人, 给得宽松一点, 但也不能无限拖。
+# 口径 = 每题 1.2 分钟 + 4 分钟审题收尾, 四舍五入到 5 分钟。
+LIMIT_TABLE = {10: 15, 15: 20, 20: 25, 30: 35}
+
+
+def limit_seconds(n: int, mode: str = '标准') -> int:
+    """
+    这套卷子给多少秒。mode: 标准 / 宽松(×1.5) / 不限时(返回 0)
+    不要靠孩子自觉 —— 时间写在库里, 到点由程序收卷。
+    """
+    n = int(n or 0)
+    if n <= 0:
+        return 0
+    if mode == '不限时':
+        return 0
+    base = LIMIT_TABLE.get(n)
+    if base is None:
+        base = int(round((4 + n * 1.2) / 5.0) * 5) or 5
+    sec = int(base * 60)
+    if mode == '宽松':
+        sec = int(sec * 1.5)
+    return sec
+
+
+def limit_text(sec: int) -> str:
+    if not sec:
+        return '不限时'
+    m, s = divmod(int(sec), 60)
+    return f'{m} 分 {s:02d} 秒' if s else f'{m} 分钟'
+
+
+def create_paper(subject: str, questions: list, phase_label: str = '', target_level: int = 3,
+                 limit_sec: int = 0) -> int:
     source = 'seed'
     if any(q['source'] == 'ai' for q in questions):
         source = 'mixed' if any(q['source'] == 'seed' for q in questions) else 'ai'
+    limit_sec = int(limit_sec or 0)
+    deadline = ''
+    if limit_sec > 0:
+        deadline = (datetime.now() + timedelta(seconds=limit_sec)).isoformat(timespec='seconds')
     with _conn() as conn:
         cur = conn.execute(
-            'INSERT INTO quiz_papers(subject,created_at,phase_label,target_level,total,source,status) '
-            'VALUES(?,?,?,?,?,?,?)',
+            'INSERT INTO quiz_papers(subject,created_at,phase_label,target_level,total,source,status,'
+            'limit_sec,deadline) VALUES(?,?,?,?,?,?,?,?,?)',
             (subject, datetime.now().isoformat(timespec='seconds'), phase_label,
-             target_level, len(questions), source, 'doing'))
+             target_level, len(questions), source, 'doing', limit_sec or None, deadline or None))
         pid = cur.lastrowid
         for i, q in enumerate(questions):
             conn.execute(
                 'INSERT INTO quiz_items(paper_id,q_index,uid,source,subject,chapter,topic,qtype,difficulty,'
-                'stem,options_json,answer,alt_json,explain,verified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                'stem,passage,options_json,answer,alt_json,points_json,explain,verified) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (pid, i, q['uid'], q['source'], subject, q.get('chapter'), q.get('topic'), q.get('qtype'),
-                 int(q.get('difficulty') or 3), q['stem'],
+                 int(q.get('difficulty') or 3), q['stem'], q.get('passage') or None,
                  json.dumps(q.get('options'), ensure_ascii=False) if q.get('options') else None,
                  str(q.get('answer')), json.dumps(q.get('alt') or [], ensure_ascii=False),
+                 json.dumps(q.get('points') or [], ensure_ascii=False) if q.get('points') else None,
                  q.get('explain'), 1 if q.get('verified') else 0))
     return pid
+
+
+def find_unfinished(subject: str, hours: int = 12) -> dict:
+    """
+    找出这个科目最近一张没交的卷子。
+    孩子把页面关掉/刷新了, 不能让卷子凭空消失 —— 接着做比重新出一套更符合直觉。
+    """
+    since = (datetime.now() - timedelta(hours=hours)).isoformat(timespec='seconds')
+    with _conn() as conn:
+        r = conn.execute(
+            "SELECT * FROM quiz_papers WHERE subject=? AND status='doing' AND created_at>=? "
+            "ORDER BY id DESC LIMIT 1", (subject, since)).fetchone()
+    return dict(r) if r else {}
+
+
+def abandon_paper(pid: int):
+    """放弃一张没交的卷。状态单独记 abandoned, 不跟'做完了'混在一起。"""
+    with _conn() as conn:
+        conn.execute("UPDATE quiz_papers SET status='abandoned', close_reason='abandoned' "
+                     "WHERE id=? AND status='doing'", (pid,))
+
+
+def paper_time_left(pid: int) -> dict:
+    """这套卷子还剩多少秒。{'limited','left','total','deadline','over'}"""
+    with _conn() as conn:
+        p = conn.execute('SELECT limit_sec, deadline FROM quiz_papers WHERE id=?', (pid,)).fetchone()
+    if not p:
+        return {'limited': False, 'left': 0, 'total': 0, 'deadline': '', 'over': False}
+    limit = int(p['limit_sec'] or 0)
+    dl = p['deadline'] or ''
+    if not limit or not dl:
+        return {'limited': False, 'left': 0, 'total': 0, 'deadline': '', 'over': False}
+    try:
+        left = (datetime.fromisoformat(dl) - datetime.now()).total_seconds()
+    except Exception:
+        return {'limited': True, 'left': limit, 'total': limit, 'deadline': dl, 'over': False}
+    return {'limited': True, 'left': max(0, int(left)), 'total': limit,
+            'deadline': dl, 'over': left <= 0}
 
 
 def get_paper(pid: int) -> dict:
@@ -1001,22 +1267,50 @@ def save_answer(item_id: int, user_answer: str):
         conn.execute('UPDATE quiz_items SET user_answer=? WHERE id=?', (str(user_answer or ''), item_id))
 
 
-def grade_paper(pid: int, subject: str) -> dict:
-    """判卷: 客观题本地硬判, 主观题 AI 参考评分(标记待家长确认)"""
+def grade_paper(pid: int, subject: str, close_reason: str = 'manual') -> dict:
+    """
+    判卷: 客观题本地硬判, 主观题按评分点判覆盖率(标记待家长确认)。
+    close_reason: manual=孩子自己交卷 / timeout=时间到被收卷。
+    没写的题一律记 0 分并标 unanswered, 原因写进 miss_reason —— 不能让"空着"和"做错"混为一谈。
+    """
     data = get_paper(pid)
     if not data:
         return {'ok': False, 'msg': f'找不到试卷 #{pid}'}
     items = data['items']
     pending_ai = []
     results = []
+    timeout_cnt = 0
     # 第一步: 先判(AI 评分要联网, 不要在写事务里做, 否则长锁)
     for it in items:
+        blank = not str(it.get('user_answer') or '').strip()
+        miss = ''
+        if blank:
+            miss = 'timeout' if close_reason == 'timeout' else 'blank'
+            timeout_cnt += 1
+        if blank and it['qtype'] != 'answer':
+            # 空着的客观题不用问 AI, 直接记错
+            results.append((it['id'], 0, None, '没有作答，记 0 分', 'exact', it['topic'], 1, miss, None))
+            continue
         if it['qtype'] == 'answer':
-            g = ai_grade(subject, it['stem'], it['answer'], it['user_answer'])
+            pts = []
+            try:
+                pts = json.loads(it.get('points_json') or '[]')
+            except Exception:
+                pts = []
+            g = ai_grade(subject, it['stem'], it['answer'], it['user_answer'], points=pts)
             score = g.get('score')
-            correct = 1 if (score is not None and score >= 6) else 0
-            results.append((it['id'], correct, score, g.get('comment'),
-                            'ai' if g.get('ok') else 'parent', it['topic']))
+            cov = g.get('coverage')
+            if cov is not None:
+                correct = 1 if cov >= POINT_PASS_LINE else 0
+            else:
+                correct = 1 if (score is not None and score >= 6) else 0
+            cmt = g.get('comment') or ''
+            if pts:
+                cmt = f"要点覆盖率 {int(round(cov * 100))}%" + (f"（{'通过' if correct else '未达到 60%'}）") + '　' + cmt
+            results.append((it['id'], correct, score, cmt,
+                            g.get('by') or ('ai' if g.get('ok') else 'parent'),
+                            it['topic'], 1 if blank else 0, miss,
+                            json.dumps(g.get('hits') or [], ensure_ascii=False) if g.get('hits') else None))
             if not g.get('ok'):
                 pending_ai.append(it['id'])
         else:
@@ -1024,13 +1318,15 @@ def grade_paper(pid: int, subject: str) -> dict:
                              'qtype': it['qtype'],
                              'options': json.loads(it['options_json']) if it['options_json'] else None},
                             it['user_answer'])
-            results.append((it['id'], 1 if ok else 0, None, None, 'exact', it['topic']))
+            results.append((it['id'], 1 if ok else 0, None, None, 'exact', it['topic'],
+                            1 if blank else 0, miss, None))
     # 第二步: 同一事务内写结果 + 更新掌握度
     with _conn() as conn:
-        for (iid, correct, score, comment, by, topic) in results:
+        for (iid, correct, score, comment, by, topic, unans, miss, hits_j) in results:
             conn.execute(
-                'UPDATE quiz_items SET correct=?, ai_score=?, ai_comment=?, graded_by=? WHERE id=?',
-                (correct, score, comment, by, iid))
+                'UPDATE quiz_items SET correct=?, ai_score=?, ai_comment=?, graded_by=?, '
+                'unanswered=?, miss_reason=?, hits_json=? WHERE id=?',
+                (correct, score, comment, by, unans, miss or None, hits_j, iid))
             update_mastery(subject, topic or '', bool(correct), conn=conn)
 
     # 统计
@@ -1039,11 +1335,14 @@ def grade_paper(pid: int, subject: str) -> dict:
     total = len(items2)
     score = round(right / total * 100, 1) if total else 0
     with _conn() as conn:
-        conn.execute('UPDATE quiz_papers SET status=?, right_cnt=?, score=?, submitted_at=? WHERE id=?',
-                     ('done', right, score, datetime.now().isoformat(timespec='seconds'), pid))
+        conn.execute('UPDATE quiz_papers SET status=?, right_cnt=?, score=?, submitted_at=?, '
+                     'close_reason=? WHERE id=?',
+                     ('done', right, score, datetime.now().isoformat(timespec='seconds'),
+                      close_reason, pid))
     pushed = push_wrong_to_mistakes(pid, subject)
     return {'ok': True, 'right': right, 'total': total, 'score': score,
-            'pending_ai': pending_ai, 'pushed': pushed['count'], 'pairs': pushed['pairs']}
+            'pending_ai': pending_ai, 'pushed': pushed['count'], 'pairs': pushed['pairs'],
+            'timeout_cnt': timeout_cnt, 'close_reason': close_reason}
 
 
 def push_wrong_to_mistakes(pid: int, subject: str) -> dict:
@@ -1057,6 +1356,22 @@ def push_wrong_to_mistakes(pid: int, subject: str) -> dict:
     for it in data.get('items', []):
         if it['correct'] == 1:
             continue
+        miss = it.get('miss_reason') or ''
+        # 未做原因要写成孩子看得懂的话, 不能只存一个 timeout 字段
+        if miss == 'timeout':
+            head = '⏰ 时间到了还没做完。'
+            reason = '时间到未作答'
+        elif miss == 'blank':
+            head = '⬜ 交卷时这题空着没写。'
+            reason = '未作答'
+        else:
+            head = ''
+            reason = '每日测试'
+        exp = it['explain'] or ''
+        if head:
+            exp = head + '先自己想一想, 再点开下面的讲解对照。\n\n' + exp
+        if it.get('ai_comment'):
+            exp = exp + ('\n\nAI 评语: ' + it['ai_comment'] if exp else 'AI 评语: ' + it['ai_comment'])
         try:
             mid = db.add_mistake(
                 subject=subject,
@@ -1065,10 +1380,17 @@ def push_wrong_to_mistakes(pid: int, subject: str) -> dict:
                 title=f"[{it['topic'] or it['chapter']}] {it['stem'][:28]}",
                 answer=it['user_answer'] or '(未作答)',
                 correct_answer=it['answer'],
-                explanation=(it['explain'] or '') + (('\n\nAI 评语: ' + it['ai_comment']) if it.get('ai_comment') else ''),
-                wrong_reason='每日测试',
+                explanation=exp or None,
+                wrong_reason=reason,
                 source='quiz',
                 diagram_json=it.get('diagram_json') or None,
+                # 下面这些是"错题本里能重做"的前提
+                qtype=it.get('qtype'),
+                options_json=it.get('options_json'),
+                points_json=it.get('points_json'),
+                passage=it.get('passage'),
+                miss_reason=miss or None,
+                uid=it.get('uid'),
             )
             n += 1
             if mid:
@@ -1076,6 +1398,88 @@ def push_wrong_to_mistakes(pid: int, subject: str) -> dict:
         except Exception:
             continue
     return {'count': n, 'pairs': pairs}
+
+
+# ============== 错题本里重做 ==============
+def retry_mistake(mid: int, user_answer: str) -> dict:
+    """
+    在错题本里把这道题再做一遍。
+    客观题本地硬判; 主观题按评分点判覆盖率(>=60% 才算出师)。
+    做对了 -> 标记已掌握; 做错了 -> 更新答案、重画讲解图, 继续留在错题本。
+    """
+    m = db.get_mistake(mid)
+    if not m:
+        return {'ok': False, 'msg': f'找不到错题 #{mid}'}
+    ans = '' if user_answer is None else str(user_answer).strip()
+    qtype = m.get('qtype') or 'fill'
+    if qtype == 'choice':
+        # 界面上点的是整条选项文字, 收成字母再存, 库里的答案才统一
+        ans = choice_letter(ans)
+    by = 'exact'
+    comment = ''
+    cov = None
+    if not ans:
+        correct, score = False, 0
+        comment = '没写答案, 记 0 分'
+    elif qtype == 'answer':
+        pts = []
+        try:
+            pts = json.loads(m.get('points_json') or '[]')
+        except Exception:
+            pts = []
+        if not pts:
+            # 老错题没有评分点 -> 从"正确答案"里把 ①②③ 拆出来当评分点用
+            pts = _points_from_answer(m.get('correct_answer') or '')
+        g = ai_grade(m.get('subject') or '', m.get('question') or '',
+                     m.get('correct_answer') or '', ans, points=pts)
+        cov = g.get('coverage')
+        score = g.get('score')
+        correct = (cov is not None and cov >= POINT_PASS_LINE) if cov is not None \
+            else (score is not None and score >= 6)
+        comment = g.get('comment') or ''
+        by = g.get('by') or ('ai' if g.get('ok') else 'parent')
+        if pts:
+            comment = f"要点覆盖率 {int(round((cov or 0) * 100))}%（{'通过' if correct else '未达到 60%'}）　" + comment
+    else:
+        opts = None
+        if m.get('options_json'):
+            try:
+                opts = json.loads(m['options_json'])
+            except Exception:
+                opts = None
+        correct = is_correct({'answer': m.get('correct_answer') or '', 'alt': [],
+                              'qtype': qtype, 'options': opts}, ans)
+        score = 10 if correct else 0
+    rid, times = db.add_redo(mid, ans, bool(correct), comment, cov, by)
+    if not correct:
+        # 还是错: 把这次的答案写回错题本身, 讲解图作废重画(下次打开就是针对这次答案的图)
+        db.update_mistake(mid, answer=ans or '(未作答)',
+                          wrong_reason=('重做第 %d 次仍错' % times) if times > 1 else '重做仍错',
+                          diagram_json=None,
+                          explanation=(m.get('explanation') or '') +
+                                      (f"\n\n【第 {times} 次重做 {datetime.now().strftime('%m-%d %H:%M')}】"
+                                       f"{ans or '（没写）'}　{comment}" if comment else ''))
+    return {'ok': True, 'correct': bool(correct), 'score': score, 'coverage': cov,
+            'comment': comment, 'by': by, 'times': times, 'redo_id': rid,
+            'msg': ('✅ 做对了！这条已经归到「已掌握」。' if correct
+                    else f'❌ 还差一点（第 {times} 次重做），讲解图已按你这次的答案重画。')}
+
+
+def _points_from_answer(text: str) -> list:
+    """老错题没有 points 字段时, 从"要点: ①…②…③…"里拆出评分点来用。"""
+    import re as _re
+    parts = _re.split(r'(?=[①②③④⑤⑥⑦⑧])', str(text or ''))
+    out = []
+    for p in parts:
+        p = p.strip(' 　：:，,')
+        if not p:
+            continue
+        no = p[0] if p[0] in '①②③④⑤⑥⑦⑧' else ''
+        body = p[1:].strip(' 　：:，,')
+        if len(body) >= 4:
+            out.append({'no': no or '①②③④⑤⑥⑦⑧'[len(out)] if len(out) < 8 else str(len(out) + 1),
+                        'text': body[:120], 'w': 1.0})
+    return _norm_points(out)
 
 
 # ============== 讲解思维导图 ==============
@@ -1086,6 +1490,20 @@ def get_item(item_id: int) -> dict:
     with _conn() as conn:
         r = conn.execute('SELECT * FROM quiz_items WHERE id=?', (item_id,)).fetchone()
     return dict(r) if r else {}
+
+
+def _row_points(row: dict):
+    """从题目行里取出评分点 / 命中结果 / 未做原因, 供画图用。取不到就给空, 不影响画图。"""
+    pts, hits = [], []
+    try:
+        pts = json.loads(row.get('points_json') or '[]')
+    except Exception:
+        pts = []
+    try:
+        hits = json.loads(row.get('hits_json') or '[]')
+    except Exception:
+        hits = []
+    return pts, hits, (row.get('miss_reason') or '')
 
 
 def _cached_spec(row: dict):
@@ -1134,9 +1552,11 @@ def gen_diagram(item_id: int, force: bool = False) -> dict:
             return {'ok': True, 'svg': diagram.render_svg(spec), 'spec': spec,
                     'error': '', 'from_cache': True, 'fallback': fb}
 
+    pts, hits, mreason = _row_points(row)
     res = diagram.build_spec(row.get('stem') or '', row.get('answer') or '',
                              row.get('explain') or '', row.get('subject') or '数学',
-                             row.get('user_answer') or '')
+                             row.get('user_answer') or '', points=pts, hits=hits,
+                             miss_reason=mreason)
     fallback, err = False, ''
     if res['ok']:
         spec = res['spec']
@@ -1144,7 +1564,8 @@ def gen_diagram(item_id: int, force: bool = False) -> dict:
         # AI 不可用/输出不合格 -> 本地按解析拆步骤, 不能让孩子看到空白
         spec = diagram.build_fallback_spec(row.get('stem') or '', row.get('answer') or '',
                                           row.get('explain') or '', row.get('topic') or '',
-                                          row.get('user_answer') or '')
+                                          row.get('user_answer') or '',
+                                          points=pts, hits=hits, miss_reason=mreason)
         fallback, err = True, res.get('error', '')
         if not spec:
             return {'ok': False, 'svg': '', 'spec': {}, 'error': err or '没有可用的解析内容',
@@ -1161,14 +1582,17 @@ def gen_diagram(item_id: int, force: bool = False) -> dict:
 def _gen_one_offline(item: dict) -> dict:
     """只调 AI 拿结构, 不碰数据库(并发安全)。失败则本地降级。"""
     import diagram
+    pts, hits, mreason = _row_points(item)
     res = diagram.build_spec(item.get('stem') or '', item.get('answer') or '',
                              item.get('explain') or '', item.get('subject') or '数学',
-                             item.get('user_answer') or '')
+                             item.get('user_answer') or '', points=pts, hits=hits,
+                             miss_reason=mreason)
     if res['ok']:
         return {'id': item['id'], 'spec': res['spec'], 'fallback': False, 'error': ''}
     spec = diagram.build_fallback_spec(item.get('stem') or '', item.get('answer') or '',
                                        item.get('explain') or '', item.get('topic') or '',
-                                       item.get('user_answer') or '')
+                                       item.get('user_answer') or '',
+                                       points=pts, hits=hits, miss_reason=mreason)
     return {'id': item['id'], 'spec': spec, 'fallback': True,
             'error': res.get('error', 'AI 未返回可用结构')}
 
@@ -1266,6 +1690,22 @@ def render_mistake_diagram(mistake: dict) -> str:
         return ''
 
 
+def _mistake_points(m: dict):
+    """
+    错题本里的题没有判卷记录, 要点命中只能按关键词粗判。
+    粗判结果只用于"提示哪里可能漏了", 页面上会写明是本地粗判。
+    """
+    pts = []
+    try:
+        pts = json.loads(m.get('points_json') or '[]')
+    except Exception:
+        pts = []
+    if not pts:
+        return [], [], (m.get('miss_reason') or '')
+    hits = local_point_hits(pts, m.get('answer') or '')
+    return pts, hits, (m.get('miss_reason') or '')
+
+
 def gen_diagram_for_mistake(mistake_id: int, force: bool = False) -> dict:
     """
     给错题本里的一条记录画讲解图。
@@ -1283,16 +1723,18 @@ def gen_diagram_for_mistake(mistake_id: int, force: bool = False) -> dict:
         if svg:
             return {'ok': True, 'svg': svg, 'spec': {}, 'error': '', 'from_cache': True}
 
+    pts, hits, mreason = _mistake_points(m)
     res = diagram.build_spec(m.get('question') or '', m.get('correct_answer') or '',
                              m.get('explanation') or '', m.get('subject') or '数学',
-                             m.get('answer') or '')
+                             m.get('answer') or '', points=pts, hits=hits, miss_reason=mreason)
     fallback, err = False, ''
     if res['ok']:
         spec = res['spec']
     else:
         spec = diagram.build_fallback_spec(m.get('question') or '', m.get('correct_answer') or '',
                                            m.get('explanation') or '', m.get('title') or '',
-                                           m.get('answer') or '')
+                                           m.get('answer') or '', points=pts, hits=hits,
+                                           miss_reason=mreason)
         fallback, err = True, res.get('error', '')
         if not spec:
             return {'ok': False, 'svg': '', 'spec': {}, 'error': err or '这道题没有解析，画不了图'}

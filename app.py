@@ -6,6 +6,7 @@
 import os
 import sys
 import time
+import json
 import base64
 import streamlit as st
 from datetime import datetime
@@ -29,6 +30,35 @@ WRONG_REASONS = ['概念不清', '计算失误', '审题错误', '公式记错',
 # 侧边栏签名(孩子可在「我的工作室 → 我的签名」里改, 20 汉字以内)
 DEFAULT_SIGNATURE = '13 岁孩子学习错题本地化记录'
 SIGNATURE_MAX = 20
+
+
+@st.fragment(run_every=1.0)
+def _qz_countdown(pid: int):
+    """
+    每秒只刷新这一小块, 不打断孩子正在写的答案。
+    时间到就把"该收卷了"这个意图放进 session_state, 再整页重跑让主流程收卷 ——
+    收卷必须走主流程, 否则拿不到页面上的答案。
+    """
+    info = quiz.paper_time_left(pid)
+    if not info.get('limited'):
+        st.caption('⏱ 本卷不限时')
+        return
+    left = int(info.get('left') or 0)
+    if left <= 0:
+        st.error('⏰ 时间到，正在自动收卷…')
+        st.session_state['qz_force_submit'] = 'timeout'
+        st.rerun()
+        return
+    m, s = divmod(left, 60)
+    color = '#C0392B' if left <= 60 else '#1F4B75'
+    st.markdown(
+        f"<div style='display:flex;align-items:baseline;gap:12px'>"
+        f"<span style='font-size:26px;font-weight:700;color:{color};"
+        f"font-variant-numeric:tabular-nums'>⏳ {m:02d}:{s:02d}</span>"
+        f"<span style='color:#777;font-size:13px'>本卷限时 {quiz.limit_text(info.get('total'))}，"
+        f"时间到自动交卷</span></div>", unsafe_allow_html=True)
+    if left <= 60:
+        st.caption('还剩不到 1 分钟，先把最有把握的写完')
 
 
 def show_diagram(svg: str, note: str = ''):
@@ -89,7 +119,10 @@ _QUIZ_NEED = ('SUBJECTS', 'TYPE_NAMES', 'init_quiz_db', 'create_paper', 'pick_qu
               'phase_log', 'manual_summary',
               # 讲解图(2026-10-27)
               'diagram_is_old', 'render_mistake_diagram', 'gen_diagram',
-              'gen_diagram_for_mistake', 'gen_diagrams_for_paper', 'sync_diagrams_to_mistakes')
+              'gen_diagram_for_mistake', 'gen_diagrams_for_paper', 'sync_diagrams_to_mistakes',
+              # 限时收卷 + 错题重做(2026-10-27 下午)
+              'limit_seconds', 'limit_text', 'paper_time_left', 'find_unfinished',
+              'abandon_paper', 'retry_mistake', 'coverage_of', 'choice_letter')
 
 
 def _quiz_missing():
@@ -591,7 +624,20 @@ if page == '📝 每日测试':
     if qz_n > _sc['in_scope']:
         st.caption(f"⚠️ 选了 {qz_n} 题，但当前进度段只有 {_sc['in_scope']} 道 —— 差的部分会先用"
                    f"「已学过的其它章节」补复习题，再用 AI 现出；题量越大等待越久。")
-    qz_use_ai = st.checkbox('题库不够时用 AI 出题补充（会自动验算, 稍慢）', value=True, key='qz_use_ai')
+
+    _l1, _l2, _l3 = st.columns([2, 2, 2])
+    with _l1:
+        _lsel = st.selectbox('⏱ 本卷限时', ['按题量自动', '宽松一些', '不限时'], index=0,
+                             key='qz_limit_mode',
+                             help='按题量自动：10 题 15 分 / 15 题 20 分 / 20 题 25 分 / 30 题 35 分。'
+                                  '时间到会自动收卷，没做完的题进错题本并注明「时间到未作答」。')
+    _lmode = {'按题量自动': '标准', '宽松一点': '宽松', '宽松一些': '宽松', '不限时': '不限时'}[_lsel]
+    _plan_sec = quiz.limit_seconds(qz_n, _lmode)
+    with _l2:
+        st.metric('本卷限时', quiz.limit_text(_plan_sec))
+    with _l3:
+        qz_use_ai = st.checkbox('题库不够时用 AI 补题', value=True, key='qz_use_ai',
+                                help='AI 出的题会自动验算，稍慢一点')
 
     if st.button('🎲 刷新一套新题', type='primary'):
         with st.spinner('正在按进度组卷, AI 出的题要过验算, 请稍等...'):
@@ -599,88 +645,175 @@ if page == '📝 每日测试':
         if not _r.get('ok'):
             st.error(f"没出成卷: {_r.get('msg', '未知原因')}。可以减少题数, 或勾上 AI 补充再试。")
         else:
-            _pid = quiz.create_paper(qz_subject, _r['questions'], (_r.get('phase') or {}).get('label', ''))
-            st.session_state['qz_questions'] = _r['questions']
+            _pid = quiz.create_paper(qz_subject, _r['questions'],
+                                     (_r.get('phase') or {}).get('label', ''),
+                                     limit_sec=_plan_sec)
             st.session_state['qz_pid'] = _pid
             st.session_state['qz_subject_done'] = qz_subject
             st.session_state['qz_report'] = None
-            st.success(f"出好了 {len(_r['questions'])} 题 · {_r.get('msg', '')}")
+            st.session_state['qz_force_submit'] = None
+            st.session_state['qz_started_at'] = time.time()
+            # 上一套卷的答案还留在 session_state 里, 不清掉会串到新卷
+            for _k in [k for k in st.session_state if str(k).startswith('qz_q_')]:
+                st.session_state.pop(_k, None)
+            st.success(f"出好了 {len(_r['questions'])} 题 · {_r.get('msg', '')}"
+                       + (f"　限时 {quiz.limit_text(_plan_sec)}" if _plan_sec else '　不限时'))
+            st.rerun()
 
-    _qs = st.session_state.get('qz_questions')
     _pid = st.session_state.get('qz_pid')
     _qs_subject = st.session_state.get('qz_subject_done')
+    _rep_now = st.session_state.get('qz_report')
+
+    # ---- 上次没交的卷: 接着做, 别让刷新把卷子弄丢 ----
+    if (not _pid or not quiz.get_paper(_pid).get('items')) and not _rep_now:
+        _u = quiz.find_unfinished(qz_subject)
+        if _u:
+            _pid = _u['id']
+            _qs_subject = _u['subject']
+            st.session_state['qz_pid'] = _pid
+            st.session_state['qz_subject_done'] = _qs_subject
+            _ui = quiz.paper_time_left(_pid)
+            st.info(f"接着上次那张没交的卷继续（{_u['subject']} · {_u.get('total') or 0} 题"
+                    + (f" · 还剩 {quiz.limit_text(_ui['left'])}" if _ui.get('limited') else '')
+                    + '）。不想做了就点下面的「放弃这张，重新出题」。')
+            if st.button('🗑 放弃这张，重新出题'):
+                quiz.abandon_paper(_pid)
+                for _k in [k for k in st.session_state if str(k).startswith('qz_q_')]:
+                    st.session_state.pop(_k, None)
+                st.session_state['qz_pid'] = None
+                st.session_state['qz_subject_done'] = None
+                st.rerun()
+
+    _items = quiz.get_paper(_pid).get('items') if _pid else []
+
+    def _collect_answers(_pid, _items):
+        """把页面上的答案写回库。每一轮都做 —— 时间到被收卷时, 来不及点交卷的答案也不会丢。
+
+        只写非空的: 空多半是"这题还没动", 如果照写就会把上次已存的答案冲掉
+        (刷新页面后控件是空的, 一轮同步就能把答案清光 —— 这个坑必须堵住)。
+        """
+        for _i, _it in enumerate(_items):
+            _k = f'qz_q_{_i}'
+            if _k not in st.session_state:
+                continue
+            _v = st.session_state.get(_k) or ''
+            if _v == '（先选一个）':
+                _v = ''
+            if isinstance(_v, list):
+                _v = ''.join(sorted(x.strip()[:1] for x in _v if x.strip()))
+            elif (_it.get('qtype') or '') == 'choice' and str(_v).strip():
+                # 界面上渲染的是整条选项文字("C. -2ab"), 存库前收成字母, 库里答案才统一
+                _v = quiz.choice_letter(_v)
+            if str(_v).strip():
+                quiz.save_answer(_it['id'], _v)
+
+    def _submit_quiz(_pid, _subj, _reason='manual'):
+        with st.spinner('判卷中, 主观题要请 AI 老师批...'):
+            _rep = quiz.grade_paper(_pid, _subj, close_reason=_reason)
+        # 判完立刻给错题画讲解图(并发; 同一道题画过就复用, 不再花 AI 调用)
+        _wrong_now = [x for x in quiz.get_paper(_pid)['items'] if x.get('correct') != 1]
+        _rep['draw_failed'] = 0
+        if _wrong_now and HAS_DIAGRAM:
+            try:
+                _stt = st.status('判卷完成，正在画讲解图…', expanded=True)
+                _dstat = quiz.gen_diagrams_for_paper(
+                    _pid, on_done=lambda d, t: _stt.update(label=f'讲解图 {d}/{t} 张…'))
+                quiz.sync_diagrams_to_mistakes(_rep.get('pairs') or [])
+                _stt.update(
+                    label=f'讲解图好了：新画 {_dstat["ok"]} 张'
+                          + (f'，{_dstat["skipped"]} 张之前画过直接复用' if _dstat['skipped'] else '')
+                          + (f'，{_dstat["failed"]} 张没画出来' if _dstat['failed'] else ''),
+                    state='complete', expanded=False)
+                _rep['diagram_stat'] = _dstat
+                _rep['draw_failed'] = _dstat['failed']
+            except Exception as e:
+                # 画图整段失败不能连累判卷结果, 报告照样要出来
+                _rep['draw_failed'] = len(_wrong_now)
+                st.warning(f'讲解图没画出来（{e}）, 分数和判卷结果不受影响。')
+        st.session_state['qz_report'] = _rep
+        st.session_state['qz_force_submit'] = None
+        return _rep
 
     # ---- 答题 ----
-    if _qs and _pid and not st.session_state.get('qz_report'):
+    if _pid and _items and not _rep_now:
+        _collect_answers(_pid, _items)          # 先把已写的存住(后面可能触发收卷)
+        _info = quiz.paper_time_left(_pid)
+        if st.session_state.get('qz_force_submit') or _info.get('over'):
+            _submit_quiz(_pid, _qs_subject, 'timeout')
+            st.rerun()
+
         st.divider()
         _type_cnt = {}
-        for _q in _qs:
-            _type_cnt[_q.get('qtype', 'fill')] = _type_cnt.get(_q.get('qtype', 'fill'), 0) + 1
-        _type_txt = ' · '.join(f"{quiz.TYPE_NAMES.get(k, k)}{v}题" for k, v in _type_cnt.items())
-        st.subheader(f'✏️ 答题（{_qs_subject} · 共 {len(_qs)} 题）')
-        st.caption(f"题型分布：{_type_txt}")
-        with st.form('qz_form'):
-            for _i, _q in enumerate(_qs):
-                if _q.get('source') == 'ai':
-                    _tag = 'AI 出题·已验算'
-                elif _q.get('review'):
-                    _tag = '题库·跨章节复习'
-                else:
-                    _tag = '题库'
-                _qtype_name = quiz.TYPE_NAMES.get(_q.get('qtype'), '')
-                st.markdown(
-                    f"**第 {_i + 1} 题**　`{_q.get('topic', '')}`　`{_qtype_name}`　难度 {'★' * int(_q.get('difficulty', 3))}　"
-                    f"<span style='color:#888888'>{_tag}</span>", unsafe_allow_html=True)
-                st.write(quiz.md_safe(_q['stem']))
-                if _q.get('qtype') == 'choice' and _q.get('options'):
-                    _opts = ['（先选一个）'] + [f"{k}. {quiz.md_safe(v)}" for k, v in _q['options'].items()]
-                    st.radio('选项', _opts, key=f'qz_q_{_i}', label_visibility='collapsed')
-                elif _q.get('qtype') == 'multi' and _q.get('options'):
-                    _opts = [f"{k}. {quiz.md_safe(v)}" for k, v in _q['options'].items()]
-                    st.multiselect('多选（少选或多选都算错）', _opts, key=f'qz_q_{_i}',
-                                   label_visibility='collapsed', placeholder='可选多个选项')
-                elif _q.get('qtype') == 'judge':
-                    st.radio('判断', ['对', '错'], key=f'qz_q_{_i}', horizontal=True,
-                             label_visibility='collapsed', index=None)
-                elif _q.get('qtype') == 'answer':
-                    st.text_area('作答', key=f'qz_q_{_i}', height=110, label_visibility='collapsed')
-                else:
-                    st.text_input('答案', key=f'qz_q_{_i}', label_visibility='collapsed')
-            _submitted = st.form_submit_button('📤 交卷', type='primary', use_container_width=True)
+        for _q in _items:
+            _tk = _q.get('qtype') or 'fill'
+            _type_cnt[_tk] = _type_cnt.get(_tk, 0) + 1
+        st.subheader(f'✏️ 答题（{_qs_subject} · 共 {len(_items)} 题）')
+        st.caption('题型分布：' + ' · '.join(
+            f"{quiz.TYPE_NAMES.get(k, k)}{v}题" for k, v in _type_cnt.items())
+            + '　｜　答案边写边存，关掉页面再回来能接着做')
+        _qz_countdown(_pid)
 
-        if _submitted:
-            _items = quiz.get_paper(_pid)['items']
-            for _i, _it in enumerate(_items):
-                _v = st.session_state.get(f'qz_q_{_i}', '')
-                if _v == '（先选一个）':
-                    _v = ''
-                if isinstance(_v, list):
-                    # 多选题存成 ABC 形式, 空格分隔的选项文字去掉
-                    _v = ''.join(sorted(x.strip()[:1] for x in _v if x.strip()))
-                quiz.save_answer(_it['id'], _v)
-            with st.spinner('判卷中, 主观题要请 AI 老师批...'):
-                _rep = quiz.grade_paper(_pid, _qs_subject)
-            # 判完立刻给错题画讲解图(并发; 同一道题画过就复用, 不再花 AI 调用)
-            _wrong_now = [x for x in quiz.get_paper(_pid)['items'] if x.get('correct') != 1]
-            _rep['draw_failed'] = 0
-            if _wrong_now and HAS_DIAGRAM:
+        for _i, _q in enumerate(_items):
+            _source = _q.get('source') or 'seed'
+            _tag = 'AI 出题·已验算' if _source == 'ai' else '题库'
+            _qtype_name = quiz.TYPE_NAMES.get(_q.get('qtype'), '')
+            _qtype_raw = _q.get('qtype') or 'fill'
+            st.markdown(
+                f"**第 {_i + 1} 题**　`{_q.get('topic', '')}`　`{_qtype_name}`　难度 {'★' * int(_q.get('difficulty') or 3)}　"
+                f"<span style='color:#888888'>{_tag}</span>", unsafe_allow_html=True)
+            # 阅读题: 原文跟题一起给, 孩子手里没课本也做得了
+            if _q.get('passage'):
+                with st.container(border=True):
+                    st.caption('📖 原文')
+                    st.markdown('\n'.join('> ' + _ln
+                                            for _ln in quiz.md_safe(_q['passage']).splitlines()))
+            st.write(quiz.md_safe(_q['stem']))
+            _opts_raw = None
+            if _q.get('options_json'):
                 try:
-                    _st = st.status('判卷完成，正在画讲解图…', expanded=True)
-                    _dstat = quiz.gen_diagrams_for_paper(
-                        _pid, on_done=lambda d, t: _st.update(label=f'讲解图 {d}/{t} 张…'))
-                    quiz.sync_diagrams_to_mistakes(_rep.get('pairs') or [])
-                    _st.update(
-                        label=f'讲解图好了：新画 {_dstat["ok"]} 张'
-                              + (f'，{_dstat["skipped"]} 张之前画过直接复用' if _dstat['skipped'] else '')
-                              + (f'，{_dstat["failed"]} 张没画出来' if _dstat['failed'] else ''),
-                        state='complete', expanded=False)
-                    _rep['diagram_stat'] = _dstat
-                    _rep['draw_failed'] = _dstat['failed']
-                except Exception as e:
-                    # 画图整段失败不能连累判卷结果, 报告照样要出来
-                    _rep['draw_failed'] = len(_wrong_now)
-                    st.warning(f'讲解图没画出来（{e}）, 分数和判卷结果不受影响。')
-            st.session_state['qz_report'] = _rep
+                    _opts_raw = json.loads(_q['options_json'])
+                except Exception:
+                    _opts_raw = None
+            _kkey = f'qz_q_{_i}'
+            _labels = ([f"{k}. {quiz.md_safe(v)}" for k, v in _opts_raw.items()]
+                       if _opts_raw else [])
+            # 刷新页面/接着做: 把库里已存的答案回填到控件上。
+            # 不回填的话, 控件是空的, 下一轮同步就会以为"孩子把答案擦了"。
+            _saved = (_q.get('user_answer') or '').strip()
+            if _saved and _kkey not in st.session_state:
+                if _qtype_raw == 'choice' and _labels:
+                    _hitlab = [x for x in _labels if x.startswith(_saved + '.')]
+                    st.session_state[_kkey] = _hitlab[0] if _hitlab else '（先选一个）'
+                elif _qtype_raw == 'multi' and _labels:
+                    st.session_state[_kkey] = [x for x in _labels if x[:1] in _saved]
+                elif _qtype_raw == 'judge':
+                    st.session_state[_kkey] = _saved if _saved in ('对', '错') else None
+                else:
+                    st.session_state[_kkey] = _saved
+            if _qtype_raw == 'choice' and _labels:
+                _opts = ['（先选一个）'] + _labels
+                st.radio('选项', _opts, key=_kkey, label_visibility='collapsed')
+            elif _qtype_raw == 'multi' and _labels:
+                st.multiselect('多选（少选或多选都算错）', _labels, key=_kkey,
+                               label_visibility='collapsed', placeholder='可选多个选项')
+            elif _qtype_raw == 'judge':
+                st.radio('判断', ['对', '错'], key=_kkey, horizontal=True,
+                         label_visibility='collapsed', index=None)
+            elif _qtype_raw == 'answer':
+                st.text_area('作答', key=_kkey, height=110, label_visibility='collapsed',
+                             placeholder='分点写，一点一行' if _q.get('points_json') else '')
+            else:
+                st.text_input('答案', key=_kkey, label_visibility='collapsed')
+
+        _bc1, _bc2 = st.columns([1, 2])
+        with _bc1:
+            _submitted = st.button('📤 交卷', type='primary', use_container_width=True)
+        with _bc2:
+            st.caption('交卷后才判分；中途离开不会丢答案，时间到会自动收卷。')
+
+        _collect_answers(_pid, _items)
+        if _submitted:
+            _submit_quiz(_pid, _qs_subject, 'manual')
             st.rerun()
 
     # ---- 判卷报告 ----
@@ -691,15 +824,49 @@ if page == '📝 每日测试':
             st.error(f"判卷失败: {_rep.get('msg', '未知原因')}")
         else:
             st.subheader('📋 判卷结果')
+            _timed_out = (_rep.get('close_reason') == 'timeout')
+            if _timed_out:
+                st.error(f"⏰ 时间到，已自动收卷。{_rep.get('timeout_cnt') or 0} 道题空着没写 —— "
+                         f"这些题已经进错题本，标了「时间到未作答」，随时可以在错题本里重做。")
             st.metric('得分', f"{_rep['score']} 分", f"答对 {_rep['right']}/{_rep['total']}")
             if _rep.get('pending_ai'):
                 st.warning(f"有 {len(_rep['pending_ai'])} 道主观题没能自动评分（AI 未配置或调用失败）, 需要家长手动批改。")
             for _i, _it in enumerate(quiz.get_paper(_pid)['items']):
                 _icon = '✅' if _it['correct'] else '❌'
-                with st.expander(f"{_icon} 第 {_i + 1} 题 · {_it['topic'] or _it['chapter'] or ''}",
+                _miss = _it.get('miss_reason') or ''
+                _flag = ''
+                if _miss == 'timeout':
+                    _flag = ' · ⏰ 时间到未作答'
+                elif _miss == 'blank':
+                    _flag = ' · ⬜ 交卷时没写'
+                with st.expander(f"{_icon} 第 {_i + 1} 题 · {_it['topic'] or _it['chapter'] or ''}{_flag}",
                                  expanded=not _it['correct']):
+                    if _it.get('passage'):
+                        with st.container(border=True):
+                            st.caption('📖 原文')
+                            st.markdown('\n'.join('> ' + _ln
+                                                  for _ln in quiz.md_safe(_it['passage']).splitlines()))
                     st.write(quiz.md_safe(_it['stem']))
                     if _it['qtype'] == 'answer':
+                        _pts, _hits = [], []
+                        try:
+                            _pts = json.loads(_it.get('points_json') or '[]')
+                            _hits = json.loads(_it.get('hits_json') or '[]')
+                        except Exception:
+                            pass
+                        if _pts:
+                            _got = sum(1 for h in _hits if h)
+                            _cov = int(round(_got / len(_pts) * 100)) if _pts else 0
+                            st.markdown(f"**要点覆盖率 {_cov}%**（{_got}/{len(_pts)} 条，"
+                                        f"{'达到 60%，算掌握' if _cov >= 60 else '不到 60%，算没掌握'}）")
+                            for _pi, _p in enumerate(_pts):
+                                _hitp = bool(_hits[_pi]) if _pi < len(_hits) else False
+                                st.markdown((f"<span style='color:#2E8B57;font-weight:700'>✓ 你写到了</span>"
+                                             if _hitp else
+                                             f"<span style='color:#C0504D;font-weight:700'>✗ 这条漏了</span>")
+                                            + f"　<b>{quiz.md_safe(_p.get('no') or '')}</b> "
+                                            + quiz.md_safe(_p.get('text') or ''),
+                                            unsafe_allow_html=True)
                         st.warning(f"AI 参考分 {_it['ai_score']}/10 —— 这是参考分, 以老师或家长为准")
                         if _it.get('ai_comment'):
                             st.info(_it['ai_comment'])
@@ -943,31 +1110,45 @@ elif page == '📖 错题本':
     with c1:
         sub_filter = st.selectbox('学科', ['全部'] + SUBJECTS, key='sub_filter')
     with c2:
-        master_filter = st.selectbox('状态', ['全部', '未掌握', '已掌握'], key='master_filter')
+        master_filter = st.selectbox('状态', ['全部', '未掌握', '已掌握', '⏰ 没做完的'], key='master_filter')
     with c3:
         limit = st.number_input('显示条数', 10, 500, 50, key='limit')
 
+    _only_unfinished = (master_filter == '⏰ 没做完的')
     items = db.list_mistakes(
         subject=sub_filter,
-        mastered=None if master_filter == '全部' else (0 if master_filter == '未掌握' else 1),
+        mastered=None if master_filter in ('全部', '⏰ 没做完的')
+        else (0 if master_filter == '未掌握' else 1),
         limit=limit,
     )
+    if _only_unfinished:
+        items = [m for m in items if (m.get('miss_reason') or '') in ('timeout', 'blank')]
 
     if not items:
-        st.info('还没有错题, 去"拍照录入"添加第一道吧.')
+        st.info('还没有错题, 去"拍照录入"添加第一道吧.' if not _only_unfinished
+                else '没有「没做完」的错题。')
     else:
         st.caption(f'共 {len(items)} 条')
         for m in items:
+            _mr = m.get('miss_reason') or ''
+            _st_txt = ('✅ 已掌握' if m['mastered']
+                       else ('⏰ ' if _mr == 'timeout' else '⬜ ' if _mr == 'blank' else '⚠️ ')
+                       + (m.get('wrong_reason') or '未掌握'))
             with st.expander(
                 f"#{m['id']} [{m['subject']}] 📅{fmt_when(m['created_at'])} "
-                f"{m.get('title') or m['question'][:40]} "
-                f"{'✅ 已掌握' if m['mastered'] else '⚠️ ' + (m.get('wrong_reason') or '未掌握')}"
+                f"{m.get('title') or m['question'][:40]} {_st_txt}"
             ):
-                tabs = st.tabs(['题目', '🧭 讲解图', '图片', 'AI 讲题', '搜题', '复习记录', '操作'])
+                tabs = st.tabs(['题目', '✍️ 重做', '🧭 讲解图', '图片', 'AI 讲题', '搜题', '复习记录', '操作'])
 
                 with tabs[0]:
+                    if m.get('passage'):
+                        st.markdown('**📖 原文**')
+                        st.markdown('\n'.join('> ' + _ln
+                                              for _ln in quiz.md_safe(m['passage']).splitlines()))
                     st.markdown('**题面**')
                     st.write(quiz.md_safe(m['question']))
+                    if m.get('miss_reason') == 'timeout':
+                        st.caption('⏰ 这道题交卷时时间到了，没写完 —— 到「✍️ 重做」里可以不限时再做一遍。')
                     if m.get('answer'):
                         st.markdown(f"**你的答案**: {quiz.md_safe(m['answer'])}")
                     if m.get('correct_answer'):
@@ -980,6 +1161,78 @@ elif page == '📖 错题本':
                                f" | 上次复习 {fmt_when(m.get('last_reviewed')) if m.get('last_reviewed') else '还没复习过'}")
 
                 with tabs[1]:
+                    st.caption('把这道题再做一遍 —— 答对了归到「已掌握」；还错的话, '
+                               '讲解图会按你这次的答案重新画，题仍留在错题本。')
+                    if m.get('miss_reason') == 'timeout':
+                        st.info('⏰ 这道题上次是**时间到没做完**，不是不会 —— 现在给你不限时，慢慢想。')
+                    if m.get('passage'):
+                        with st.container(border=True):
+                            st.caption('📖 原文')
+                            st.markdown('\n'.join('> ' + _ln
+                                                    for _ln in quiz.md_safe(m['passage']).splitlines()))
+                    st.write(quiz.md_safe(m['question']))
+
+                    _rk_ans = f'rd_{m["id"]}'
+                    _opts = None
+                    if m.get('options_json'):
+                        try:
+                            _opts = json.loads(m['options_json'])
+                        except Exception:
+                            _opts = None
+                    _qt = m.get('qtype') or 'fill'
+                    if _qt == 'choice' and _opts:
+                        _labels = ['（先选一个）'] + [f"{k}. {quiz.md_safe(v)}" for k, v in _opts.items()]
+                        _val = st.radio('选项', _labels, key=_rk_ans, label_visibility='collapsed')
+                    elif _qt == 'multi' and _opts:
+                        _labels = [f"{k}. {quiz.md_safe(v)}" for k, v in _opts.items()]
+                        _val = st.multiselect('多选', _labels, key=_rk_ans,
+                                              label_visibility='collapsed', placeholder='可选多个选项')
+                    elif _qt == 'judge':
+                        _val = st.radio('判断', ['对', '错'], key=_rk_ans, horizontal=True,
+                                        label_visibility='collapsed', index=None)
+                    elif _qt == 'answer':
+                        _val = st.text_area('你的答案', key=_rk_ans, height=120,
+                                            label_visibility='collapsed', placeholder='分点写，一点一行')
+                    else:
+                        _val = st.text_input('你的答案', key=_rk_ans, label_visibility='collapsed')
+                    if st.button('✅ 提交这次的答案', key=f'rd_sub_{m["id"]}', type='primary'):
+                        _v = _val or ''
+                        if _v == '（先选一个）':
+                            _v = ''
+                        if isinstance(_v, list):
+                            _v = ''.join(sorted(x.strip()[:1] for x in _v if x.strip()))
+                        elif _qt == 'choice' and str(_v).strip():
+                            _v = quiz.choice_letter(_v)
+                        with st.spinner('判题中…'):
+                            _rr = quiz.retry_mistake(m['id'], _v)
+                        st.session_state[f'rd_res_{m["id"]}'] = _rr
+                        backup.push_after_change()
+                        st.rerun()
+
+                    _res = st.session_state.get(f'rd_res_{m["id"]}')
+                    if _res:
+                        if not _res.get('ok'):
+                            st.error(_res.get('msg') or '重做失败')
+                        elif _res.get('correct'):
+                            st.success(_res.get('msg') or '做对了')
+                        else:
+                            st.warning(_res.get('msg') or '还差点')
+                        if _res.get('comment'):
+                            st.caption(_res['comment'])
+                        st.caption('要看讲解就切到「🧭 讲解图」，图最下面的红色卡片写着这次错在哪。'
+                                   '（答错后讲解图会重画，第一次打开要等 3~6 秒）')
+
+                    _hist = db.list_redos(m['id'], limit=8)
+                    if _hist:
+                        st.markdown('**重做记录**')
+                        for _h in _hist:
+                            st.caption(f"{_h['at'][:16].replace('T', ' ')} · "
+                                       f"{'✅ 对' if _h['correct'] else '❌ 错'} · "
+                                       f"答: {(_h['answer'] or '（没写）')[:40]}"
+                                       + (f" · 覆盖率 {int(round((_h['coverage'] or 0) * 100))}%"
+                                          if _h.get('coverage') is not None else ''))
+
+                with tabs[2]:
                     if not HAS_DIAGRAM:
                         st.warning('讲解图要新版后台模块才能用，当前进程里还是旧模块。'
                                    '重启服务后这里就会恢复。')
@@ -1019,7 +1272,7 @@ elif page == '📖 错题本':
                                 if m.get('explanation'):
                                     st.caption('这道题有解析文字, 但画图失败了; 上面的「题目」里能看到文字讲解。')
 
-                with tabs[2]:
+                with tabs[3]:
                     if m.get('image_path'):
                         try:
                             st.image(relative_to_abs(m['image_path']), use_container_width=True)
@@ -1068,11 +1321,11 @@ elif page == '📖 错题本':
                     else:
                         st.info('无图片')
 
-                with tabs[3]:
+                with tabs[4]:
                     st.caption(f"当前 AI 服务: {llm.config_info()['provider_display']}")
                     _render_ai_tab(m)
 
-                with tabs[4]:
+                with tabs[5]:
                     if st.button(f'🌐 联网搜题 #{m["id"]}', key=f'search_{m["id"]}'):
                         with st.spinner('搜索中...'):
                             res = web_search.solve_with_search(m['question'], m['subject'])
@@ -1090,7 +1343,7 @@ elif page == '📖 错题本':
                             with st.expander('展开查看(原文多为英文)', expanded=not cn):
                                 st.write(res['summary'])
 
-                with tabs[5]:
+                with tabs[6]:
                     st.write(f"复习次数: {m['review_count']}, 上次: {m.get('last_reviewed') or '未复习'}")
                     rating = st.slider('这次复习掌握程度', 1, 4, 3, key=f'r_{m["id"]}',
                                        help='1=忘了 2=模糊 3=记得 4=熟练')
@@ -1102,7 +1355,7 @@ elif page == '📖 错题本':
                         time.sleep(0.5)
                         st.rerun()
 
-                with tabs[6]:
+                with tabs[7]:
                     st.markdown('**✏️ 修改这条错题**(识图认错了? 直接在这里改, 不用重新拍)')
                     new_q = st.text_area('题面', value=m['question'], height=120, key=f'q_{m["id"]}')
                     new_ans = st.text_input('孩子当时的答案', value=m.get('answer') or '', key=f'ans_{m["id"]}')

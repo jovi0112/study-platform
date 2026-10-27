@@ -10,7 +10,8 @@ import os
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'study.db')
+# STUDY_DB 让自动化测试/临时实例能指到别的库文件, 不去碰孩子的真实数据
+DB_PATH = os.environ.get('STUDY_DB') or os.path.join(os.path.dirname(__file__), 'data', 'study.db')
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mistakes (
@@ -103,6 +104,26 @@ def init_db():
         _ensure_column(conn, 'mistakes', 'good_prompts', 'TEXT')
         # 讲解思维导图: 存图解结构(JSON), 渲染很快, 所以存 spec 不存 SVG
         _ensure_column(conn, 'mistakes', 'diagram_json', 'TEXT')
+        # 从每日测试进来的错题要能"在错题本里重做", 所以题型/选项/评分点必须一起带过来
+        _ensure_column(conn, 'mistakes', 'qtype', 'TEXT')
+        _ensure_column(conn, 'mistakes', 'options_json', 'TEXT')
+        _ensure_column(conn, 'mistakes', 'points_json', 'TEXT')   # 主观题评分点 [{no,text,w}]
+        _ensure_column(conn, 'mistakes', 'passage', 'TEXT')       # 阅读题原文(没课本也做得了)
+        _ensure_column(conn, 'mistakes', 'miss_reason', 'TEXT')   # 未做原因: timeout / blank / ''
+        _ensure_column(conn, 'mistakes', 'uid', 'TEXT')
+        conn.executescript("""
+CREATE TABLE IF NOT EXISTS mistake_redo (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mistake_id INTEGER NOT NULL,
+    answer TEXT,                    -- 这次重做写的答案
+    correct INTEGER,                -- 1 对 / 0 错
+    coverage REAL,                  -- 主观题要点覆盖率(0~1)
+    comment TEXT,
+    graded_by TEXT,                 -- exact / ai / parent
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redo_mistake ON mistake_redo(mistake_id);
+""")
 
 
 def _ensure_column(conn, table: str, column: str, definition: str):
@@ -122,7 +143,8 @@ def add_mistake(subject, question, **kwargs):
         if v is not None and k in ('grade', 'title', 'answer', 'correct_answer',
                                      'explanation', 'wrong_reason',
                                      'knowledge_id', 'image_path', 'source',
-                                     'diagram_json'):
+                                     'diagram_json', 'qtype', 'options_json',
+                                     'points_json', 'passage', 'miss_reason', 'uid'):
             fields.append(k)
             placeholders.append('?')
             values.append(v)
@@ -156,13 +178,24 @@ def get_mistake(mid):
         return dict(r) if r else None
 
 
+_MISTAKE_COLS = ('grade', 'title', 'answer', 'correct_answer', 'explanation', 'wrong_reason',
+                 'knowledge_id', 'image_path', 'source', 'diagram_json', 'qtype', 'options_json',
+                 'points_json', 'passage', 'miss_reason', 'uid', 'question', 'subject',
+                 'last_reviewed', 'review_count', 'mastered')
+
+
 def update_mistake(mid, **kwargs):
     if not kwargs:
         return
     sets, params = [], []
     for k, v in kwargs.items():
+        # 只放行真实存在的列 —— 打错字段名会直接把 SQL 拼坏, 静默吞掉更新
+        if k not in _MISTAKE_COLS:
+            continue
         sets.append(f"{k}=?")
         params.append(v)
+    if not sets:
+        return
     params.append(mid)
     with get_conn() as conn:
         conn.execute(f"UPDATE mistakes SET {','.join(sets)} WHERE id=?", params)
@@ -217,6 +250,29 @@ def delete_good_prompt(mid, text: str):
         lines = [ln for ln in row['good_prompts'].split('\n') if ln.strip() and ln.strip() != text.strip()]
         conn.execute("UPDATE mistakes SET good_prompts=? WHERE id=?",
                      ('\n'.join(lines), mid))
+
+
+def add_redo(mid, answer, correct, comment='', coverage=None, graded_by=''):
+    """记一次"在错题本里重做"的结果, 返回 redo id"""
+    now = datetime.now().isoformat(timespec='seconds')
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO mistake_redo(mistake_id, answer, correct, coverage, comment, graded_by, at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (mid, str(answer or ''), 1 if correct else 0, coverage, comment, graded_by, now))
+        n = conn.execute("SELECT COUNT(*) c FROM mistake_redo WHERE mistake_id=?", (mid,)).fetchone()['c']
+        # 重做对了就归到已掌握; 错了继续留在错题本, 复习次数也记上
+        conn.execute("UPDATE mistakes SET last_reviewed=?, review_count=review_count+1, "
+                     "mastered=CASE WHEN ?=1 THEN 1 ELSE 0 END WHERE id=?",
+                     (now, 1 if correct else 0, mid))
+        return cur.lastrowid, n
+
+
+def list_redos(mid, limit=20):
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM mistake_redo WHERE mistake_id=? "
+                            "ORDER BY id DESC LIMIT ?", (mid, limit)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def mark_reviewed(mid, rating, note=None):

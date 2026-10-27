@@ -36,8 +36,9 @@ FONT = "'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
 W = 800
 PAD = 30
 
-# 结构版本: 老版本(没有错点定位)的图会被判为过期并重画, 免得孩子看到一张不带红标的旧图
-SPEC_VER = 2
+# 结构版本: 老版本的图会被判为过期并重画, 免得孩子看到一张缺东西的旧图
+# v1 无错点定位 / v2 有错点定位 / v3 增加"评分要点逐条命中"清单(阅读、简答靠它看清漏了哪条)
+SPEC_VER = 3
 
 
 # ============== 文字宽度估算与折行 ==============
@@ -207,12 +208,25 @@ def sanitize_spec(raw, fallback_title='') -> dict:
         if s:
             steps.append(fit(s, 240, 11.5))
 
+    # --- 评分要点清单: 主观题(阅读/简答)逐条显示"这条你写了 / 这条漏了" ---
+    # 命中与否是判卷时算出来的权威结果, 不让 AI 自己编, 所以这里只做清洗。
+    checks = []
+    for c in (raw.get('checks') or [])[:8]:
+        if not isinstance(c, dict):
+            continue
+        t = str(c.get('text') or '').strip()
+        if not t:
+            continue
+        checks.append({'no': str(c.get('no') or '').strip()[:3],
+                       'text': fit(t, 620, 11.5),
+                       'hit': bool(c.get('hit'))})
+
     # --- 错点定位: 孩子答错了才画红框; AI 有时塞字符串进来, 一律按 dict 处理 ---
     m_raw = raw.get('mistake')
     if not isinstance(m_raw, dict):
         m_raw = {}
     # 长度上限按"卡片实际可用宽度"给: 卡片宽 740-28, why/fix 可折到 3 行, 不要提前截成一句话
-    my = fit(str(m_raw.get('my') or '').strip(), 360, 12)
+    my = fit(str(m_raw.get('my') or '').strip(), 640, 12)
     at = fit(str(m_raw.get('at') or m_raw.get('where') or '').strip(), 200, 12)
     why = fit(str(m_raw.get('why') or '').strip(), 660, 11.5)
     fix = fit(str(m_raw.get('fix') or '').strip(), 660, 11.5)
@@ -233,10 +247,30 @@ def sanitize_spec(raw, fallback_title='') -> dict:
         'cases': cases,
         'verdicts': verdicts,
         'steps': steps,
+        'checks': checks,
         'answer': fit(str(raw.get('answer') or '').strip(), 620, 13),
         'mistake': mistake,
         'v': SPEC_VER,
     }
+
+
+def make_checks(points: list, hits: list) -> list:
+    """评分点 + 判卷命中结果 -> 图上要点清单。判卷的 hits 是权威数据, 不让 AI 再猜一遍。"""
+    out = []
+    pts = points or []
+    for i, p in enumerate(pts[:8]):
+        t = str((p or {}).get('text') or '').strip()
+        if not t:
+            continue
+        h = bool(hits[i]) if hits and i < len(hits) else False
+        out.append({'no': str((p or {}).get('no') or '①②③④⑤⑥⑦⑧'[i] if i < 8 else str(i + 1)),
+                    'text': fit(t, 620, 11.5), 'hit': h})
+    return out
+
+
+def missed_text(checks: list) -> str:
+    miss = [c['no'] for c in (checks or []) if not c['hit']]
+    return ('漏了要点 ' + ''.join(miss)) if miss else ''
 
 
 # ============== 数轴渲染 ==============
@@ -372,8 +406,10 @@ def _render_mistake_card(mis: dict, x: float, y: float, width: float):
         if text_width(my_s, 12) <= room:
             parts.append(_text(x + width - 14, cy, my_s, 12, '#8A5A4A', 'end', '600'))
         else:
-            cy += 18
-            parts.append(_text(x + 14, cy, fit(my_s, inner, 12), 12, '#8A5A4A', 'start', '600'))
+            # 孩子的答案往往很长, 截成一句"…"等于没说 —— 折两行放完整
+            for ln in wrap(my_s, inner, 12, 2):
+                cy += 18
+                parts.append(_text(x + 14, cy, ln, 12, '#8A5A4A', 'start', '600'))
     cy += 20
 
     if at:
@@ -561,6 +597,29 @@ def render_svg(spec: dict, foot_note: str = '') -> str:
                              f'stroke="{C_KEY_STROKE}" stroke-width="1.4"/>')
         y += 4
 
+    # --- 评分要点清单: 主观题逐条标"你写了 / 漏了" ---
+    checks = spec.get('checks') or []
+    if checks:
+        y += 10
+        got = sum(1 for c in checks if c['hit'])
+        parts.append(_text(PAD, y + 13,
+                           f'📋 评分要点（答到 {got}/{len(checks)} 条 · ✓ 你写到了 · ✗ 漏掉了）',
+                           12.5, '#1F4B75', 'start', '700'))
+        y += 26
+        for c in checks:
+            lines = wrap((c['no'] + ' ' + c['text']).strip(), W - PAD * 2 - 130, 11.5, 2)
+            bh = 12 + 17 * len(lines)
+            fill, stroke = (C_OK_FILL, C_OK_STROKE) if c['hit'] else (C_BAD_FILL, C_BAD_STROKE)
+            parts.append(_rect(PAD, y, W - PAD * 2, bh, fill, stroke, rx=7,
+                               sw=1.6 if not c['hit'] else 1.2))
+            parts.append(_text(PAD + 14, y + 18, '✓' if c['hit'] else '✗', 13,
+                               '#2E8B57' if c['hit'] else '#C0504D', 'start', '700'))
+            for li, ln in enumerate(lines):
+                parts.append(_text(PAD + 34, y + 18 + li * 17, ln, 11.5, C_TEXT))
+            parts.append(_text(W - PAD - 14, y + 18, '你写到了' if c['hit'] else '这条漏了', 11.5,
+                               '#2E8B57' if c['hit'] else '#C0504D', 'end', '700'))
+            y += bh + 8
+
     # --- 汇总结论 ---
     if spec.get('answer'):
         y += 10
@@ -694,19 +753,38 @@ def _spec_system(subject: str) -> str:
 
 
 def build_spec(question: str, answer: str, explain: str, subject: str = '数学',
-               user_answer: str = '') -> dict:
+               user_answer: str = '', points: list = None, hits: list = None,
+               miss_reason: str = '') -> dict:
     """
     调用 AI 产出图解结构。返回 {'ok':bool, 'spec':dict, 'error':str}
     这是唯一需要联网的环节; 失败时调用方应回退到 build_fallback_spec()。
     user_answer = 孩子实际写的答案, 用于让 AI 定位错点(图上的红色错因框); 没有就传空串。
+    points/hits = 主观题评分点和判卷命中情况: 命中结果来自判卷, 权威且不让 AI 编,
+      图上会逐条列出"这条你写了 / 这条漏了", 这是孩子最需要看的部分。
+    miss_reason = 'timeout' 表示这题是时间到没做完, 图上要照实说。
     """
     import llm
     if not llm.is_llm_enabled():
         return {'ok': False, 'spec': {}, 'error': 'AI 老师未配置，无法生成图解'}
     my = (user_answer or '').strip()
-    user = ('科目：%s\n题目：%s\n\n孩子写的答案：%s\n正确答案：%s\n\n解析：%s\n\n请输出图解 JSON（重点填好 mistake 错点定位）。'
+    checks = make_checks(points, hits)
+    extra = ''
+    if checks:
+        miss = missed_text(checks)
+        extra = ('\n\n评分要点（判卷已逐条核对，不要改判定结果）：\n'
+                 + '\n'.join(('✓ 已答到 ' if c['hit'] else '✗ 漏掉 ') + c['no'] + ' ' + c['text']
+                              for c in checks)
+                 + ('\nmistake.why 要针对' + miss + '说：孩子为什么没答到这一层（角度没换 / 没回原文找依据 / 只答了内容没答情感），'
+                    'fix 要给出这一条应该怎么答。' if miss else
+                    '\n所有要点都答到了 —— mistake.why 写"要点都答到了"，fix 写还能怎么答得更完整。'))
+    if miss_reason == 'timeout':
+        extra += ('\n\n特别注意：这题是**考试时间到了没做完**，不是孩子不会。'
+                  'mistake.at 写"时间到未作答"，why 写"时间不够，这题没写完"，'
+                  'fix 写这道题最快的切入思路（先答哪一点），帮孩子下次抢时间。')
+    user = ('科目：%s\n题目：%s\n\n孩子写的答案：%s\n正确答案：%s\n\n解析：%s%s\n\n'
+            '请输出图解 JSON（重点填好 mistake 错点定位）。'
             % (subject, question, my or '（没作答）', answer,
-               explain or '（无解析，请你自己推导一遍）'))
+               explain or '（无解析，请你自己推导一遍）', extra))
     raw = llm._call_chat(_spec_system(subject), user, json_mode=True)
     if not isinstance(raw, dict) or raw.get('error'):
         return {'ok': False, 'spec': {}, 'error': str((raw or {}).get('error') or 'AI 没有返回内容')}
@@ -714,16 +792,27 @@ def build_spec(question: str, answer: str, explain: str, subject: str = '数学'
     if not spec or not (spec.get('cases') or spec.get('verdicts')
                         or spec.get('steps') or spec.get('answer')):
         return {'ok': False, 'spec': {}, 'error': 'AI 返回的内容不完整，没法画图'}
+    if checks:
+        spec['checks'] = checks
+    if miss_reason == 'timeout':
+        spec['mistake'] = dict(spec.get('mistake') or {},
+                               my=my or '（没作答）', at='时间到未作答')
+        if not (spec['mistake'].get('why')):
+            spec['mistake']['why'] = '考试时间到了，这题没来得及做完'
     if my:
         spec.setdefault('mistake', {})
         if not spec['mistake'].get('my'):
             spec['mistake'] = dict(spec['mistake'], my=my)
+    # AI 没说清错在哪、但我们判出漏了要点 -> 直接把漏的要点标上去, 不留空
+    if checks and spec.get('mistake') and not spec['mistake'].get('at'):
+        spec['mistake']['at'] = missed_text(checks) or spec['mistake'].get('at') or ''
     spec = fill_compare_axis(spec, question)
     return {'ok': True, 'spec': spec, 'error': ''}
 
 
 def build_fallback_spec(question: str, answer: str, explain: str, topic: str = '',
-                        user_answer: str = '') -> dict:
+                        user_answer: str = '', points: list = None, hits: list = None,
+                        miss_reason: str = '') -> dict:
     """
     AI 不可用时的本地降级: 不联网, 把解析按句拆成步骤图。
     宁可给一张朴素的步骤图, 也不让孩子看到一个空白区域。
@@ -745,8 +834,19 @@ def build_fallback_spec(question: str, answer: str, explain: str, topic: str = '
         'steps': steps,
         'answer': str(answer or ''),
     })
+    # 有评分点时, 哪怕 AI 不在也要把"哪条写了、哪条漏了"画出来 —— 这是孩子最需要的部分
+    checks = make_checks(points, hits)
+    if checks:
+        spec['checks'] = checks
     my = (user_answer or '').strip()
-    if my:
-        spec['mistake'] = {'my': my, 'at': 'AI 未接入，无法定位具体哪一步',
-                           'step': None, 'why': '对照下面的步骤，找出自己卡住的那一步', 'fix': ''}
+    if miss_reason == 'timeout':
+        spec['mistake'] = {'my': my or '（没作答）', 'at': '时间到未作答',
+                           'step': None, 'why': '考试时间到了，这题没来得及做完',
+                           'fix': '先看清题目问什么，挑最有把握的一点先写'}
+    elif my:
+        at = missed_text(checks) if checks else 'AI 未接入，无法定位具体哪一步'
+        spec['mistake'] = {'my': my, 'at': at, 'step': None,
+                           'why': ('对照上面的要点清单，找出自己漏的是哪一条'
+                                   if checks else '对照下面的步骤，找出自己卡住的那一步'),
+                           'fix': ''}
     return spec
