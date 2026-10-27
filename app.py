@@ -17,6 +17,7 @@ import ocr
 import llm
 import web_search
 import backup
+import quiz
 
 # ============== 路径 ==============
 APP_DIR = os.path.dirname(__file__)
@@ -38,6 +39,8 @@ st.set_page_config(
 
 # 初始化数据库
 db.init_db()
+# 每日测试模块的表(试卷/题目/掌握度/AI 题库)
+quiz.init_quiz_db()
 
 # 云端数据是临时存储(每次重新部署都会被清空), 所以一启动就先把备份里的数据找回来
 _backup_start = backup.startup_sync()
@@ -334,6 +337,7 @@ def _render_ai_tab(m):
 st.sidebar.title('📚 学习积累平台')
 st.sidebar.caption(db.get_setting('signature', DEFAULT_SIGNATURE) or DEFAULT_SIGNATURE)
 page = st.sidebar.radio('导航', [
+    '📝 每日测试',
     '📷 拍照录入',
     '📖 错题本',
     '🔁 复习计划',
@@ -371,6 +375,162 @@ if _backup_start.get('restored'):
 
 st.sidebar.divider()
 st.sidebar.caption(f"v0.1 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+
+# ============== 页面 0: 每日测试 (按朝阳区进度出题 → 自动判卷 → 错题讲解) ==============
+if page == '📝 每日测试':
+    st.title('📝 每日测试')
+    st.caption('按北京朝阳区教学进度出题 → 自动判卷 → 错题自动进错题本。选择题填空题本地硬判; 简答作文由 AI 给参考分, 需家长确认。')
+
+    def _qz_reset():
+        """换科目时把上一套卷子清掉, 免得答的是 A 科卷、判的是 B 科标准"""
+        for k in ('qz_questions', 'qz_pid', 'qz_subject_done', 'qz_report'):
+            st.session_state[k] = None
+
+    # ---- 今日进度 ----
+    st.subheader('📅 今天该练到哪')
+    _pc = st.columns(3)
+    for _i, _s in enumerate(quiz.SUBJECTS):
+        _ph = quiz.current_phase(_s)
+        with _pc[_i]:
+            if _ph:
+                st.markdown(f"**{_s}** · {_ph['label']}")
+                st.caption(_ph.get('detail', ''))
+            else:
+                st.warning(f'{_s}: 教学日历没读到, 检查 data/quiz_calendar.json')
+
+    st.divider()
+
+    # ---- 选科出题 ----
+    _c1, _c2 = st.columns([2, 2])
+    with _c1:
+        qz_subject = st.selectbox('科目', quiz.SUBJECTS, key='qz_subject_sel', on_change=_qz_reset)
+    with _c2:
+        qz_n = st.slider('题数', 5, 20, 10, key='qz_n')
+    qz_use_ai = st.checkbox('题库不够时用 AI 出题补充（会自动验算, 稍慢）', value=True, key='qz_use_ai')
+
+    if st.button('🎲 刷新一套新题', type='primary'):
+        with st.spinner('正在按进度组卷, AI 出的题要过验算, 请稍等...'):
+            _r = quiz.pick_questions(qz_subject, n=qz_n, use_ai=qz_use_ai)
+        if not _r.get('ok'):
+            st.error(f"没出成卷: {_r.get('msg', '未知原因')}。可以减少题数, 或勾上 AI 补充再试。")
+        else:
+            _pid = quiz.create_paper(qz_subject, _r['questions'], (_r.get('phase') or {}).get('label', ''))
+            st.session_state['qz_questions'] = _r['questions']
+            st.session_state['qz_pid'] = _pid
+            st.session_state['qz_subject_done'] = qz_subject
+            st.session_state['qz_report'] = None
+            st.success(f"出好了 {len(_r['questions'])} 题 · {_r.get('msg', '')}")
+
+    _qs = st.session_state.get('qz_questions')
+    _pid = st.session_state.get('qz_pid')
+    _qs_subject = st.session_state.get('qz_subject_done')
+
+    # ---- 答题 ----
+    if _qs and _pid and not st.session_state.get('qz_report'):
+        st.divider()
+        st.subheader(f'✏️ 答题（{_qs_subject} · 共 {len(_qs)} 题）')
+        with st.form('qz_form'):
+            for _i, _q in enumerate(_qs):
+                _tag = 'AI 出题·已验算' if _q['source'] == 'ai' else '题库'
+                st.markdown(
+                    f"**第 {_i + 1} 题**　`{_q.get('topic', '')}`　难度 {'★' * int(_q.get('difficulty', 3))}　"
+                    f"<span style='color:#888888'>{_tag}</span>", unsafe_allow_html=True)
+                st.write(_q['stem'])
+                if _q['qtype'] == 'choice' and _q.get('options'):
+                    _opts = ['（先选一个）'] + [f"{k}. {v}" for k, v in _q['options'].items()]
+                    st.radio('选项', _opts, key=f'qz_q_{_i}', label_visibility='collapsed')
+                elif _q['qtype'] == 'answer':
+                    st.text_area('作答', key=f'qz_q_{_i}', height=110, label_visibility='collapsed')
+                else:
+                    st.text_input('答案', key=f'qz_q_{_i}', label_visibility='collapsed')
+            _submitted = st.form_submit_button('📤 交卷', type='primary', use_container_width=True)
+
+        if _submitted:
+            _items = quiz.get_paper(_pid)['items']
+            for _i, _it in enumerate(_items):
+                _v = st.session_state.get(f'qz_q_{_i}', '')
+                if _v == '（先选一个）':
+                    _v = ''
+                quiz.save_answer(_it['id'], _v)
+            with st.spinner('判卷中, 主观题要请 AI 老师批...'):
+                _rep = quiz.grade_paper(_pid, _qs_subject)
+            st.session_state['qz_report'] = _rep
+            st.rerun()
+
+    # ---- 判卷报告 ----
+    _rep = st.session_state.get('qz_report')
+    if _rep:
+        st.divider()
+        if not _rep.get('ok'):
+            st.error(f"判卷失败: {_rep.get('msg', '未知原因')}")
+        else:
+            st.subheader('📋 判卷结果')
+            st.metric('得分', f"{_rep['score']} 分", f"答对 {_rep['right']}/{_rep['total']}")
+            if _rep.get('pending_ai'):
+                st.warning(f"有 {len(_rep['pending_ai'])} 道主观题没能自动评分（AI 未配置或调用失败）, 需要家长手动批改。")
+            for _i, _it in enumerate(quiz.get_paper(_pid)['items']):
+                _icon = '✅' if _it['correct'] else '❌'
+                with st.expander(f"{_icon} 第 {_i + 1} 题 · {_it['topic'] or _it['chapter'] or ''}",
+                                 expanded=not _it['correct']):
+                    st.write(_it['stem'])
+                    if _it['qtype'] == 'answer':
+                        st.warning(f"AI 参考分 {_it['ai_score']}/10 —— 这是参考分, 以老师或家长为准")
+                        if _it.get('ai_comment'):
+                            st.info(_it['ai_comment'])
+                        st.caption('参考答案要点: ' + str(_it['answer'])[:300])
+                    else:
+                        st.write(f"你的答案: **{_it['user_answer'] or '(没作答)'}**　|　正确答案: **{_it['answer']}**")
+                    if _it.get('explain'):
+                        st.caption('讲解: ' + _it['explain'])
+                    if not _it['correct']:
+                        if st.button('🧠 让 AI 老师再讲一遍', key=f'qz_more_{_it["id"]}'):
+                            with st.spinner('AI 老师正在准备讲解...'):
+                                _sol = llm.solve(_it['stem'], _qs_subject, mode='full')
+                            if _sol.get('error') or not _sol.get('explanation'):
+                                st.error(f"讲解失败: {_sol.get('error') or 'AI 没返回结果'}")
+                            else:
+                                st.markdown(_sol['explanation'])
+            st.success('错题已经自动放进错题本了, 去「📖 错题本」能看到完整讲解。')
+            if st.button('🔄 再来一套', key='qz_again'):
+                _qz_reset()
+                st.rerun()
+
+    # ---- 错题归纳 / 掌握度 / 历史 ----
+    st.divider()
+    st.subheader(f'📊 {qz_subject} 错题归纳（近 30 天）')
+    _w = quiz.wrong_summary(qz_subject, days=30)
+    if _w:
+        st.dataframe([{'知识点': x['topic'], '所在章节': x['chapter'], '错次数': x['c']} for x in _w],
+                     use_container_width=True)
+    else:
+        st.caption('最近 30 天这个科目还没有测试错题记录。')
+
+    _ms = quiz.get_mastery(qz_subject)
+    if _ms:
+        with st.expander('📈 掌握度（决定下次出题难度）'):
+            st.dataframe([{'知识点': k, '难度档': v['level'], '答对': v['right_cnt'], '答错': v['wrong_cnt']}
+                          for k, v in sorted(_ms.items(), key=lambda x: x[1]['level'])],
+                         use_container_width=True)
+            st.caption('答对升档（题变难）, 答错降档（题变简单）, 范围 1~5 档。')
+
+    _hist = [p for p in quiz.list_papers(qz_subject, limit=12) if p['status'] == 'done']
+    if _hist:
+        with st.expander('🗂 最近几次测试成绩'):
+            st.dataframe([{'时间': p['created_at'][:16], '进度': p['phase_label'], '得分': p['score'],
+                           '对/总': f"{p['right_cnt']}/{p['total']}", '题源': p['source']} for p in _hist],
+                         use_container_width=True)
+
+    # ---- 家长调进度 ----
+    st.divider()
+    with st.expander('👨‍👩‍👧 家长: 学校进度和日历不一致时, 在这里调'):
+        st.caption('正数 = 学校讲得慢, 往后推; 负数 = 学校讲得快, 往前提。改完立刻生效。')
+        for _s in quiz.SUBJECTS:
+            _cur = quiz.get_offset(_s)
+            _v = st.number_input(f'{_s} 进度偏移（天）', value=_cur, step=1, key=f'qz_off_{_s}')
+            if _v != _cur:
+                quiz.set_offset(_s, _v)
+                st.rerun()
 
 
 # ============== 页面 1: 拍照录入 ==============
