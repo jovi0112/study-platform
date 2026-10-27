@@ -434,6 +434,26 @@ def ai_double_check(subject: str, stem: str, answer: str) -> dict:
             'raw': text}
 
 
+# ============== 显示安全 ==============
+_MD_SPECIAL = re.compile(r'([\\`*_$<>|])')
+
+
+def md_safe(text) -> str:
+    """
+    题干/选项/答案在页面上是用 Markdown 渲染的, 里面这些字符会被当成格式标记吞掉:
+      `*`  -> 斜体        (m049: 计算 x*y ... (-2)*3  变成  ( -2)3, 乘号消失)
+      `_`  -> 斜体/粗体    (m041: ____°____  变成  °′, 填空线消失)
+      `$`  -> 数学公式     (两处 $ 之间的内容会被 KaTeX 重排)
+      `<>` -> HTML 标签
+    题库和 AI 生成的题都可能带这些字符, 所以在渲染前统一转义, 保证屏幕上和题库一字不差。
+    """
+    if text is None:
+        return ''
+    s = str(text)
+    s = s.replace('&', '&amp;')
+    return _MD_SPECIAL.sub(r'\\\1', s)
+
+
 # ============== 判卷 ==============
 def normalize(s) -> str:
     """答案标准化: 全角转半角、去空白、中文标点转英文、去掉常见单位后缀"""

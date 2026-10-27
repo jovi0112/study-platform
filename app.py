@@ -468,12 +468,12 @@ if page == '📝 每日测试':
                 st.markdown(
                     f"**第 {_i + 1} 题**　`{_q.get('topic', '')}`　`{_qtype_name}`　难度 {'★' * int(_q.get('difficulty', 3))}　"
                     f"<span style='color:#888888'>{_tag}</span>", unsafe_allow_html=True)
-                st.write(_q['stem'])
+                st.write(quiz.md_safe(_q['stem']))
                 if _q.get('qtype') == 'choice' and _q.get('options'):
-                    _opts = ['（先选一个）'] + [f"{k}. {v}" for k, v in _q['options'].items()]
+                    _opts = ['（先选一个）'] + [f"{k}. {quiz.md_safe(v)}" for k, v in _q['options'].items()]
                     st.radio('选项', _opts, key=f'qz_q_{_i}', label_visibility='collapsed')
                 elif _q.get('qtype') == 'multi' and _q.get('options'):
-                    _opts = [f"{k}. {v}" for k, v in _q['options'].items()]
+                    _opts = [f"{k}. {quiz.md_safe(v)}" for k, v in _q['options'].items()]
                     st.multiselect('多选（少选或多选都算错）', _opts, key=f'qz_q_{_i}',
                                    label_visibility='collapsed', placeholder='可选多个选项')
                 elif _q.get('qtype') == 'judge':
@@ -515,16 +515,17 @@ if page == '📝 每日测试':
                 _icon = '✅' if _it['correct'] else '❌'
                 with st.expander(f"{_icon} 第 {_i + 1} 题 · {_it['topic'] or _it['chapter'] or ''}",
                                  expanded=not _it['correct']):
-                    st.write(_it['stem'])
+                    st.write(quiz.md_safe(_it['stem']))
                     if _it['qtype'] == 'answer':
                         st.warning(f"AI 参考分 {_it['ai_score']}/10 —— 这是参考分, 以老师或家长为准")
                         if _it.get('ai_comment'):
                             st.info(_it['ai_comment'])
-                        st.caption('参考答案要点: ' + str(_it['answer'])[:300])
+                        st.caption('参考答案要点: ' + quiz.md_safe(str(_it['answer'])[:300]))
                     else:
-                        st.write(f"你的答案: **{_it['user_answer'] or '(没作答)'}**　|　正确答案: **{_it['answer']}**")
+                        st.write(f"你的答案: **{quiz.md_safe(_it['user_answer']) or '(没作答)'}**　"
+                                 f"|　正确答案: **{quiz.md_safe(_it['answer'])}**")
                     if _it.get('explain'):
-                        st.caption('讲解: ' + _it['explain'])
+                        st.caption('讲解: ' + quiz.md_safe(_it['explain']))
                     if not _it['correct']:
                         if st.button('🧠 让 AI 老师再讲一遍', key=f'qz_more_{_it["id"]}'):
                             with st.spinner('AI 老师正在准备讲解...'):
@@ -754,11 +755,11 @@ elif page == '📖 错题本':
 
                 with tabs[0]:
                     st.markdown('**题面**')
-                    st.write(m['question'])
+                    st.write(quiz.md_safe(m['question']))
                     if m.get('answer'):
-                        st.markdown(f"**你的答案**: {m['answer']}")
+                        st.markdown(f"**你的答案**: {quiz.md_safe(m['answer'])}")
                     if m.get('correct_answer'):
-                        st.markdown(f"**正确答案**: {m['correct_answer']}")
+                        st.markdown(f"**正确答案**: {quiz.md_safe(m['correct_answer'])}")
                     if m.get('explanation'):
                         st.markdown(f"**解答**: {m['explanation']}")
                     st.caption(f"📅 录入于 {fmt_when(m['created_at'])}"
