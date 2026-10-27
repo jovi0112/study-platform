@@ -609,7 +609,8 @@ if page == '📷 拍照录入':
                     st.session_state.pop('ai_ocr', None)
                     st.session_state.pop('final_text', None)
                 if llm.is_vision_enabled() and st.session_state.get('ai_auto', True):
-                    with st.spinner('AI 看图中(手写题更准, 会先抄一遍再校对一遍, 约 10-20 秒)…'):
+                    with st.spinner('AI 看图中(手写题更准, 先抄一遍再校对一遍, 通常 10 秒左右; '
+                                    '赶上服务商限流会自动排队重试, 最坏可能要 1-2 分钟, 别关页面)…'):
                         st.session_state['ai_ocr'] = run_ai_read(abs_path)
 
             try:
