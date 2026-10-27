@@ -80,6 +80,17 @@ CREATE TABLE IF NOT EXISTS mastery (
     PRIMARY KEY(subject, topic)
 );
 
+-- 章节手动指定的变更记录(学校跳讲时家长手动改, 每条改动都留痕, 可回溯)
+CREATE TABLE IF NOT EXISTS phase_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject TEXT NOT NULL,
+    action TEXT NOT NULL,          -- set_manual / clear_manual
+    before_text TEXT,              -- 改之前是什么
+    after_text TEXT,               -- 改成什么
+    note TEXT,                     -- 家长填的原因
+    at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ai_bank (
     uid TEXT PRIMARY KEY,
     subject TEXT NOT NULL,
@@ -136,18 +147,189 @@ def set_offset(subject: str, days: int):
     db.set_setting(f'quiz_offset_{subject}', str(int(days)))
 
 
+# ============== 手动指定章节 ==============
+# 为什么需要: 学校常常跳着讲(先讲第三章再回头补第二章), 纯按日期推算必然对不上.
+# 家长指定后写库长期生效, 每次改动都进 phase_log 留痕, 可一键恢复"按日历自动".
+MANUAL_KEY = 'quiz_manual_phase_{}'
+
+# 一个科目最多允许同时选几段(太多了会变成"什么都练", 等于没有进度)
+MAX_MANUAL_PHASES = 3
+
+
+def get_manual(subject: str) -> dict:
+    """
+    读家长的手动指定. 返回 {'indices':[...], 'topics':[...], 'set_at':..., 'note':...}
+    没指定返回 {}.
+    """
+    raw = db.get_setting(MANUAL_KEY.format(subject), '') or ''
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            return {}
+        idx = [int(i) for i in (d.get('indices') or [])]
+        if not idx:
+            return {}
+        return {'indices': idx, 'topics': list(d.get('topics') or []),
+                'set_at': (d.get('set_at') or '').replace('T', ' '),   # 老数据带 T, 统一成空格
+                'note': d.get('note') or ''}
+    except Exception:
+        # 存坏了就当没指定, 走日历自动, 不能因为一条坏配置把整页搞崩
+        return {}
+
+
+def phase_options(subject: str) -> list:
+    """给选择器用的选项: 每个进度段的序号/标题/日期区间/知识点"""
+    out = []
+    for i, ph in enumerate(phases_of(subject)):
+        out.append({'index': i, 'label': ph.get('label', ''),
+                    'detail': ph.get('detail', ''),
+                    'from': ph.get('from', ''), 'to': ph.get('to', ''),
+                    'topics': list(ph.get('topics') or [])})
+    return out
+
+
+def _log_phase(subject: str, action: str, before: str, after: str, note: str = ''):
+    with _conn() as conn:
+        conn.execute(
+            'INSERT INTO phase_log(subject, action, before_text, after_text, note, at) '
+            'VALUES(?,?,?,?,?,?)',
+            (subject, action, before, after, note or '',
+             datetime.now().isoformat(timespec='seconds')))
+
+
+def set_manual(subject: str, indices: list, topics: list = None, note: str = '') -> dict:
+    """
+    手动指定某科当前在学哪些进度段(可多段), 可再限定只练其中部分知识点.
+    indices: 进度段序号(0 开始); topics: 留空=整个段全练
+    返回 {'ok':bool, 'msg':str, 'manual':{...}}
+    """
+    phs = phases_of(subject)
+    if not phs:
+        return {'ok': False, 'msg': f'{subject} 的教学日历没读到, 没法指定', 'manual': {}}
+    raw_idx = [int(i) for i in (indices or [])]
+    idx = sorted({i for i in raw_idx if 0 <= i < len(phs)})
+    if not idx:
+        if raw_idx:
+            return {'ok': False,
+                    'msg': f'选的章节不在日历里（{subject} 一共只有 {len(phs)} 段，序号 0~{len(phs) - 1}）',
+                    'manual': {}}
+        return {'ok': False, 'msg': '至少要选一个章节', 'manual': {}}
+    if len(idx) > MAX_MANUAL_PHASES:
+        return {'ok': False,
+                'msg': f'最多同时指定 {MAX_MANUAL_PHASES} 段 —— 选太多就变成"什么都练", 等于没有进度',
+                'manual': {}}
+
+    # topics 只能落在所选段的范围内, 防止配置和段对不上
+    allowed = []
+    for i in idx:
+        allowed += list(phs[i].get('topics') or [])
+    tps = [t for t in (topics or []) if t in allowed]
+    if tps and len(tps) == len(allowed):
+        tps = []          # 全选了就等于整段, 去掉限定, 免得日志里啰嗦
+
+    before = _manual_text(get_manual(subject), subject)
+    payload = {'indices': idx, 'topics': tps,
+               'set_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+               'note': (note or '').strip()[:120]}
+    db.set_setting(MANUAL_KEY.format(subject), json.dumps(payload, ensure_ascii=False))
+
+    after = _manual_text(payload, subject)
+    _log_phase(subject, 'set_manual', before, after, payload['note'])
+    return {'ok': True, 'msg': f'已记录: {after}', 'manual': payload}
+
+
+def clear_manual(subject: str, note: str = '') -> dict:
+    """恢复成按教学日历自动推算"""
+    m = get_manual(subject)
+    if not m:
+        return {'ok': True, 'msg': f'{subject} 本来就是按日历自动的, 不需要恢复', 'manual': {}}
+    before = _manual_text(m, subject)
+    db.set_setting(MANUAL_KEY.format(subject), '')
+    _log_phase(subject, 'clear_manual', before, '按教学日历自动', note)
+    return {'ok': True, 'msg': f'已改回按日历自动（原为: {before}）', 'manual': {}}
+
+
+def _manual_text(m: dict, subject: str) -> str:
+    """把手动指定翻译成一句人话, 给日志和界面用"""
+    if not m:
+        return '按教学日历自动'
+    phs = phases_of(subject)
+    labels = [phs[i].get('label', '') for i in (m.get('indices') or []) if 0 <= i < len(phs)]
+    txt = ' + '.join(labels) or '（无效指定）'
+    if m.get('topics'):
+        txt += f"（只练 {'、'.join(m['topics'])}）"
+    return txt
+
+
+def manual_summary(subject: str) -> str:
+    m = get_manual(subject)
+    if not m:
+        return ''
+    when = m.get('set_at', '')
+    return _manual_text(m, subject) + (f' · 指定于 {when}' if when else '')
+
+
+def phase_log(subject: str = '', limit: int = 30) -> list:
+    """进度变更记录, 最近的在前"""
+    sql = 'SELECT * FROM phase_log'
+    args = []
+    if subject:
+        sql += ' WHERE subject=?'
+        args.append(subject)
+    sql += ' ORDER BY id DESC LIMIT ?'
+    args.append(int(limit))
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
 def phases_of(subject: str) -> list:
     cal = load_calendar()
     return (cal.get('subjects', {}).get(subject) or {}).get('phases', [])
 
 
 def current_phase(subject: str, on: date = None) -> dict:
-    """按日期定位进度段. 返回 {label, detail, topics, index, total, from, to} 或 None"""
-    on = on or date.today()
-    on = on + timedelta(days=get_offset(subject))
+    """
+    当前该练哪一段.
+    优先级: 家长手动指定 > 按日期从教学日历推算.
+    返回 {label, detail, topics, index, total, from, to, manual?}
+    """
     phs = phases_of(subject)
     if not phs:
         return None
+
+    # ---- 1) 家长手动指定优先 ----
+    m = get_manual(subject)
+    if m:
+        idx = [i for i in m['indices'] if 0 <= i < len(phs)]
+        if idx:
+            picked = [phs[i] for i in idx]
+            topics = []
+            for p in picked:
+                for t in (p.get('topics') or []):
+                    if t not in topics:
+                        topics.append(t)
+            # 段内再限定: 只保留家长勾选的知识点
+            if m.get('topics'):
+                sel = [t for t in topics if t in m['topics']]
+                if sel:
+                    topics = sel
+            if len(picked) == 1:
+                label = picked[0].get('label', '')
+                detail = picked[0].get('detail', '')
+            else:
+                label = ' + '.join(p.get('label', '') for p in picked)
+                detail = ' ／ '.join(p.get('detail', '') for p in picked if p.get('detail'))
+            return {'label': label, 'detail': detail, 'topics': topics,
+                    'index': idx[0], 'total': len(phs),
+                    'from': min(p['from'] for p in picked), 'to': max(p['to'] for p in picked),
+                    'manual': True, 'manual_set_at': m.get('set_at', ''),
+                    'manual_note': m.get('note', '')}
+
+    # ---- 2) 按日期推算 ----
+    on = on or date.today()
+    on = on + timedelta(days=get_offset(subject))
     iso = on.isoformat()
     for i, ph in enumerate(phs):
         if ph['from'] <= iso <= ph['to']:
@@ -158,12 +340,16 @@ def current_phase(subject: str, on: date = None) -> dict:
     return {**phs[-1], 'index': len(phs) - 1, 'total': len(phs), 'out_of_range': 'after'}
 
 
+
 def progress_hint(subject: str) -> str:
     """给家长/孩子看的一句进度说明"""
     ph = current_phase(subject)
     if not ph:
         return f'{subject}: 教学日历未配置, 请到家长端检查 data/quiz_calendar.json'
     base = f"{ph['label']}（第 {ph['index'] + 1}/{ph['total']} 段）"
+    if ph.get('manual'):
+        when = ph.get('manual_set_at') or ''
+        return base + f" · 家长手动指定{f'（{when}）' if when else ''}"
     if ph.get('out_of_range') == 'before':
         return base + ' · 还没开学, 现在按第一段出题'
     if ph.get('out_of_range') == 'after':

@@ -402,10 +402,81 @@ if page == '📝 每日测试':
         _ph = quiz.current_phase(_s)
         with _pc[_i]:
             if _ph:
-                st.markdown(f"**{_s}** · {_ph['label']}")
+                _man = _ph.get('manual')
+                st.markdown(f"**{_s}** · {_ph['label']}"
+                            + ('　`📌 手动指定`' if _man else ''), unsafe_allow_html=True)
                 st.caption(_ph.get('detail', ''))
+                if _man:
+                    st.caption(f"指定于 {_ph.get('manual_set_at') or '—'}（改回自动见下方「手动指定章节」）")
+                else:
+                    st.caption('按教学日历自动推算')
             else:
                 st.warning(f'{_s}: 教学日历没读到, 检查 data/quiz_calendar.json')
+
+    # ---- 手动指定章节(学校跳着讲时用) ----
+    with st.expander('📌 学校跳着讲？手动指定章节（选完长期生效，每次改动都记录在案）'):
+        _ms = st.selectbox('哪一科', quiz.SUBJECTS, key='qz_man_subject')
+        _opts = quiz.phase_options(_ms)
+        if not _opts:
+            st.warning('这一科的教学日历是空的，没法指定')
+        else:
+            _cur = quiz.get_manual(_ms)
+            # 控件 key 里带上"当前已存状态"的指纹: 保存/恢复后指纹变化 -> 控件按库里真实状态重建,
+            # 否则会出现"已改回自动, 界面还显示旧选择"的假象(Streamlit 的 widget 状态按 key 复用)
+            _fp = f"{_cur.get('set_at', '')}|{','.join(map(str, _cur.get('indices') or []))}"
+            _labels = [f"第{i}段 · {o['label']}（{o['from']} ~ {o['to']}）" for i, o in enumerate(_opts)]
+            _picked = st.multiselect(
+                '现在学校在讲哪几段？（可多选，最多 3 段；选了就按这个出题，不再按日期推算）',
+                _labels,
+                default=[_labels[i] for i in (_cur.get('indices') or []) if 0 <= i < len(_labels)],
+                key=f'qz_man_phases_{_ms}_{_fp}')
+            _picked_idx = [_labels.index(x) for x in _picked]
+
+            # 二级：段内再缩到具体知识点（学校可能连小节都跳）
+            _topics_pool = []
+            for _i2 in _picked_idx:
+                for _t in _opts[_i2]['topics']:
+                    if _t not in _topics_pool:
+                        _topics_pool.append(_t)
+            _topics_sel = []
+            if _topics_pool:
+                _def_topics = [t for t in (_cur.get('topics') or []) if t in _topics_pool] or _topics_pool
+                _topics_sel = st.multiselect(
+                    '再细一点：本段里只练哪些知识点？（默认全选，不细就用默认）',
+                    _topics_pool, default=_def_topics,
+                    key=f'qz_man_topics_{_ms}_{_fp}_{hash(tuple(_picked_idx)) % 9999}')
+            _note = st.text_input('备注（为什么改，给自己留个说明，可不填）',
+                                  value=_cur.get('note', ''), key=f'qz_man_note_{_ms}')
+
+            st.caption(f"当前生效：**{quiz.manual_summary(_ms) or '按教学日历自动'}**")
+
+            _b1, _b2 = st.columns(2)
+            with _b1:
+                if st.button('✅ 保存并立即按这个出题', type='primary', use_container_width=True,
+                             key=f'qz_man_save_{_ms}', disabled=not _picked_idx):
+                    _r = quiz.set_manual(_ms, _picked_idx, _topics_sel, _note)
+                    if _r['ok']:
+                        for _k in ('qz_questions', 'qz_pid', 'qz_subject_done', 'qz_report'):
+                            st.session_state[_k] = None
+                        st.success(_r['msg'])
+                        st.rerun()
+                    else:
+                        st.error(_r['msg'])
+            with _b2:
+                if st.button('↩️ 改回按日历自动', use_container_width=True, key=f'qz_man_clear_{_ms}'):
+                    _r = quiz.clear_manual(_ms, _note)
+                    for _k in ('qz_questions', 'qz_pid', 'qz_subject_done', 'qz_report'):
+                        st.session_state[_k] = None
+                    st.info(_r['msg'])
+                    st.rerun()
+
+            _logs = quiz.phase_log(_ms, limit=8)
+            if _logs:
+                st.markdown('**改动记录**（最近的在上）')
+                for _lg in _logs:
+                    _what = '手动指定' if _lg['action'] == 'set_manual' else '改回自动'
+                    st.caption(f"{_lg['at'][:16].replace('T', ' ')} · {_what}：{_lg['after_text']}"
+                               + (f"　（备注：{_lg['note']}）" if _lg.get('note') else ''))
 
     st.divider()
 
@@ -567,13 +638,17 @@ if page == '📝 每日测试':
     # ---- 家长调进度 ----
     st.divider()
     with st.expander('👨‍👩‍👧 家长: 学校进度和日历不一致时, 在这里调'):
-        st.caption('正数 = 学校讲得慢, 往后推; 负数 = 学校讲得快, 往前提。改完立刻生效。')
+        st.caption('两种调法，**上面的「手动指定章节」优先**：')
+        st.caption('· 学校整章跳着讲 → 用页面顶部的「📌 手动指定章节」，直接选章节，最准。')
+        st.caption('· 只是快/慢一两周、章节顺序没变 → 用下面的天数偏移更省事。')
         for _s in quiz.SUBJECTS:
+            st.markdown(f"**{_s}** · 现在按：{quiz.progress_hint(_s)}")
             _cur = quiz.get_offset(_s)
             _v = st.number_input(f'{_s} 进度偏移（天）', value=_cur, step=1, key=f'qz_off_{_s}')
             if _v != _cur:
                 quiz.set_offset(_s, _v)
                 st.rerun()
+        st.caption('注：这一科一旦用了「手动指定章节」，天数偏移对它就不起作用了（手动指定优先）。')
 
 
 # ============== 页面 1: 拍照录入 ==============
