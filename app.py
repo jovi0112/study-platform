@@ -18,7 +18,7 @@ import llm
 import web_search
 import backup
 import quiz
-
+import diagram
 # ============== 路径 ==============
 APP_DIR = os.path.dirname(__file__)
 UPLOAD_DIR = os.path.join(APP_DIR, 'uploads')
@@ -29,6 +29,40 @@ WRONG_REASONS = ['概念不清', '计算失误', '审题错误', '公式记错',
 # 侧边栏签名(孩子可在「我的工作室 → 我的签名」里改, 20 汉字以内)
 DEFAULT_SIGNATURE = '13 岁孩子学习错题本地化记录'
 SIGNATURE_MAX = 20
+
+
+def show_diagram(svg: str, note: str = ''):
+    """
+    显示讲解思维导图(SVG)。
+    用 iframe 而不是 st.markdown: markdown 会把 svg 里的标签当 HTML 过滤掉, 图会变空白;
+    st.image 只吃路径/URL/字节, 不吃 SVG 字符串。
+    优先 st.iframe(新版 API), 老版本退回 components.html —— 免得哪天 Streamlit 升级把旧接口删了图就没了。
+    """
+    if not svg:
+        return
+    h = 420
+    if 'viewBox="0 0 ' in svg:
+        try:
+            h = int(float(svg.split('viewBox="0 0 ')[1].split('"')[0].split()[1]))
+        except Exception:
+            pass
+    html = ('<style>html,body{margin:0;padding:0;overflow:hidden;background:transparent}</style>' + svg)
+    shown = False
+    try:
+        st.iframe(html, height=h + 12)
+        shown = True
+    except (AttributeError, TypeError):
+        shown = False
+    if not shown:
+        try:
+            import streamlit.components.v1 as components
+            components.html(html, height=h + 12, scrolling=False)
+            shown = True
+        except Exception as e:
+            st.caption(f'这张图没能显示出来({e}), 但讲解文字还在下面。')
+    if shown and note:
+        st.caption(note)
+
 
 st.set_page_config(
     page_title='学习积累平台',
@@ -568,6 +602,26 @@ if page == '📝 每日测试':
                 quiz.save_answer(_it['id'], _v)
             with st.spinner('判卷中, 主观题要请 AI 老师批...'):
                 _rep = quiz.grade_paper(_pid, _qs_subject)
+            # 判完立刻给错题画讲解图(并发; 同一道题画过就复用, 不再花 AI 调用)
+            _wrong_now = [x for x in quiz.get_paper(_pid)['items'] if x.get('correct') != 1]
+            _rep['draw_failed'] = 0
+            if _wrong_now:
+                try:
+                    _st = st.status('判卷完成，正在画讲解图…', expanded=True)
+                    _dstat = quiz.gen_diagrams_for_paper(
+                        _pid, on_done=lambda d, t: _st.update(label=f'讲解图 {d}/{t} 张…'))
+                    quiz.sync_diagrams_to_mistakes(_rep.get('pairs') or [])
+                    _st.update(
+                        label=f'讲解图好了：新画 {_dstat["ok"]} 张'
+                              + (f'，{_dstat["skipped"]} 张之前画过直接复用' if _dstat['skipped'] else '')
+                              + (f'，{_dstat["failed"]} 张没画出来' if _dstat['failed'] else ''),
+                        state='complete', expanded=False)
+                    _rep['diagram_stat'] = _dstat
+                    _rep['draw_failed'] = _dstat['failed']
+                except Exception as e:
+                    # 画图整段失败不能连累判卷结果, 报告照样要出来
+                    _rep['draw_failed'] = len(_wrong_now)
+                    st.warning(f'讲解图没画出来（{e}）, 分数和判卷结果不受影响。')
             st.session_state['qz_report'] = _rep
             st.rerun()
 
@@ -597,6 +651,25 @@ if page == '📝 每日测试':
                                  f"|　正确答案: **{quiz.md_safe(_it['answer'])}**")
                     if _it.get('explain'):
                         st.caption('讲解: ' + quiz.md_safe(_it['explain']))
+                    # 讲解思维导图: 错题默认都配一张
+                    if not _it['correct']:
+                        _svg = quiz.render_mistake_diagram(_it)
+                        if _svg:
+                            st.markdown('**🧭 讲解图**')
+                            show_diagram(_svg)
+                            if st.button('🎨 换一张图', key=f'qz_redraw_{_it["id"]}'):
+                                with st.spinner('重画中...'):
+                                    quiz.gen_diagram(_it['id'], force=True)
+                                st.rerun()
+                        else:
+                            st.caption('这道题还没画讲解图。')
+                            if st.button('🎨 画一张讲解图', key=f'qz_draw_{_it["id"]}'):
+                                with st.spinner('画图中(约 3~6 秒)...'):
+                                    _dr = quiz.gen_diagram(_it['id'])
+                                if not _dr['ok']:
+                                    st.error(f"没画出来: {_dr['error']}")
+                                else:
+                                    st.rerun()
                     if not _it['correct']:
                         if st.button('🧠 让 AI 老师再讲一遍', key=f'qz_more_{_it["id"]}'):
                             with st.spinner('AI 老师正在准备讲解...'):
@@ -605,7 +678,10 @@ if page == '📝 每日测试':
                                 st.error(f"讲解失败: {_sol.get('error') or 'AI 没返回结果'}")
                             else:
                                 st.markdown(_sol['explanation'])
-            st.success('错题已经自动放进错题本了, 去「📖 错题本」能看到完整讲解。')
+            _ds = _rep.get('diagram_stat') or {}
+            if _ds.get('failed'):
+                st.warning(f"有 {_ds['failed']} 道错题的讲解图没画出来, 可以在对应题目里点「画一张讲解图」重试。")
+            st.success('错题已经自动放进错题本了, 去「📖 错题本」能看到完整讲解和讲解图。')
             if st.button('🔄 再来一套', key='qz_again'):
                 _qz_reset()
                 st.rerun()
@@ -827,7 +903,7 @@ elif page == '📖 错题本':
                 f"{m.get('title') or m['question'][:40]} "
                 f"{'✅ 已掌握' if m['mastered'] else '⚠️ ' + (m.get('wrong_reason') or '未掌握')}"
             ):
-                tabs = st.tabs(['题目', '图片', 'AI 讲题', '搜题', '复习记录', '操作'])
+                tabs = st.tabs(['题目', '🧭 讲解图', '图片', 'AI 讲题', '搜题', '复习记录', '操作'])
 
                 with tabs[0]:
                     st.markdown('**题面**')
@@ -844,6 +920,30 @@ elif page == '📖 错题本':
                                f" | 上次复习 {fmt_when(m.get('last_reviewed')) if m.get('last_reviewed') else '还没复习过'}")
 
                 with tabs[1]:
+                    _svg = quiz.render_mistake_diagram(m)
+                    if _svg:
+                        st.caption('一张图看清这题的解法主线: 已知条件 → 关键判断 → 分情况 → 逐条结论')
+                        show_diagram(_svg)
+                        if st.button('🎨 换一张图重新画', key=f'md_redraw_{m["id"]}'):
+                            with st.spinner('重画中(约 3~6 秒)…'):
+                                _r = quiz.gen_diagram_for_mistake(m['id'], force=True)
+                            if _r['ok']:
+                                st.rerun()
+                            else:
+                                st.error(f"没画出来: {_r['error']}")
+                    else:
+                        st.caption('这道错题还没有讲解图。点下面的按钮, AI 会把这题的解法画成一张思维导图。')
+                        if st.button('🎨 画一张讲解图', key=f'md_draw_{m["id"]}'):
+                            with st.spinner('画图中(约 3~6 秒)…'):
+                                _r = quiz.gen_diagram_for_mistake(m['id'])
+                            if _r['ok']:
+                                st.rerun()
+                            else:
+                                st.error(f"没画出来: {_r['error']}")
+                                if m.get('explanation'):
+                                    st.caption('这道题有解析文字, 但画图失败了; 上面的「题目」里能看到文字讲解。')
+
+                with tabs[2]:
                     if m.get('image_path'):
                         try:
                             st.image(relative_to_abs(m['image_path']), use_container_width=True)
@@ -892,11 +992,11 @@ elif page == '📖 错题本':
                     else:
                         st.info('无图片')
 
-                with tabs[2]:
+                with tabs[3]:
                     st.caption(f"当前 AI 服务: {llm.config_info()['provider_display']}")
                     _render_ai_tab(m)
 
-                with tabs[3]:
+                with tabs[4]:
                     if st.button(f'🌐 联网搜题 #{m["id"]}', key=f'search_{m["id"]}'):
                         with st.spinner('搜索中...'):
                             res = web_search.solve_with_search(m['question'], m['subject'])
@@ -914,7 +1014,7 @@ elif page == '📖 错题本':
                             with st.expander('展开查看(原文多为英文)', expanded=not cn):
                                 st.write(res['summary'])
 
-                with tabs[4]:
+                with tabs[5]:
                     st.write(f"复习次数: {m['review_count']}, 上次: {m.get('last_reviewed') or '未复习'}")
                     rating = st.slider('这次复习掌握程度', 1, 4, 3, key=f'r_{m["id"]}',
                                        help='1=忘了 2=模糊 3=记得 4=熟练')
@@ -926,7 +1026,7 @@ elif page == '📖 错题本':
                         time.sleep(0.5)
                         st.rerun()
 
-                with tabs[5]:
+                with tabs[6]:
                     st.markdown('**✏️ 修改这条错题**(识图认错了? 直接在这里改, 不用重新拍)')
                     new_q = st.text_area('题面', value=m['question'], height=120, key=f'q_{m["id"]}')
                     new_ans = st.text_input('孩子当时的答案', value=m.get('answer') or '', key=f'ans_{m["id"]}')

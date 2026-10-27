@@ -124,6 +124,10 @@ def init_quiz_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     with _conn() as conn:
         conn.executescript(QUIZ_SCHEMA)
+        # 兼容旧库: 讲解图的结构存在这里, 已生成过的不再重复调 AI
+        cols = {r[1] for r in conn.execute('PRAGMA table_info(quiz_items)')}
+        if 'diagram_json' not in cols:
+            conn.execute('ALTER TABLE quiz_items ADD COLUMN diagram_json TEXT')
 
 
 # ============== 教学日历 ==============
@@ -1030,19 +1034,24 @@ def grade_paper(pid: int, subject: str) -> dict:
     with _conn() as conn:
         conn.execute('UPDATE quiz_papers SET status=?, right_cnt=?, score=?, submitted_at=? WHERE id=?',
                      ('done', right, score, datetime.now().isoformat(timespec='seconds'), pid))
-    push_wrong_to_mistakes(pid, subject)
-    return {'ok': True, 'right': right, 'total': total, 'score': score, 'pending_ai': pending_ai}
+    pushed = push_wrong_to_mistakes(pid, subject)
+    return {'ok': True, 'right': right, 'total': total, 'score': score,
+            'pending_ai': pending_ai, 'pushed': pushed['count'], 'pairs': pushed['pairs']}
 
 
-def push_wrong_to_mistakes(pid: int, subject: str) -> int:
-    """判完把错题流进现有错题本, 复用讲解链路"""
+def push_wrong_to_mistakes(pid: int, subject: str) -> dict:
+    """
+    判完把错题流进现有错题本, 复用讲解链路。
+    返回 {'count': n, 'pairs': [(mistake_id, item_id), ...]} —— pairs 供后续把讲解图挂上去。
+    """
     data = get_paper(pid)
     n = 0
+    pairs = []
     for it in data.get('items', []):
         if it['correct'] == 1:
             continue
         try:
-            db.add_mistake(
+            mid = db.add_mistake(
                 subject=subject,
                 question=it['stem'],
                 grade='初一',
@@ -1052,11 +1061,213 @@ def push_wrong_to_mistakes(pid: int, subject: str) -> int:
                 explanation=(it['explain'] or '') + (('\n\nAI 评语: ' + it['ai_comment']) if it.get('ai_comment') else ''),
                 wrong_reason='每日测试',
                 source='quiz',
+                diagram_json=it.get('diagram_json') or None,
             )
             n += 1
+            if mid:
+                pairs.append((mid, it['id']))
+        except Exception:
+            continue
+    return {'count': n, 'pairs': pairs}
+
+
+# ============== 讲解思维导图 ==============
+MAX_DIAGRAMS_PER_PAPER = 15     # 一次判卷最多画几张(实测 4 并发下 15 张约 10 秒)
+
+
+def get_item(item_id: int) -> dict:
+    with _conn() as conn:
+        r = conn.execute('SELECT * FROM quiz_items WHERE id=?', (item_id,)).fetchone()
+    return dict(r) if r else {}
+
+
+def _cached_spec(row: dict):
+    raw = row.get('diagram_json')
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        spec = d.get('spec') if isinstance(d, dict) else None
+        return (spec, bool(d.get('fallback'))) if spec else None
+    except Exception:
+        return None
+
+
+def gen_diagram(item_id: int, force: bool = False) -> dict:
+    """
+    给卷内某道题生成「讲解思维导图」。
+    返回 {'ok','svg','spec','error','from_cache','fallback'}
+    已生成过的直接复用, 不重复花 AI 调用。
+    """
+    import diagram
+    row = get_item(item_id)
+    if not row:
+        return {'ok': False, 'svg': '', 'spec': {}, 'error': '题目不存在', 'from_cache': False}
+
+    if not force:
+        hit = _cached_spec(row)
+        if hit:
+            spec, fb = hit
+            return {'ok': True, 'svg': diagram.render_svg(spec), 'spec': spec,
+                    'error': '', 'from_cache': True, 'fallback': fb}
+
+    res = diagram.build_spec(row.get('stem') or '', row.get('answer') or '',
+                             row.get('explain') or '', row.get('subject') or '数学')
+    fallback, err = False, ''
+    if res['ok']:
+        spec = res['spec']
+    else:
+        # AI 不可用/输出不合格 -> 本地按解析拆步骤, 不能让孩子看到空白
+        spec = diagram.build_fallback_spec(row.get('stem') or '', row.get('answer') or '',
+                                          row.get('explain') or '', row.get('topic') or '')
+        fallback, err = True, res.get('error', '')
+        if not spec:
+            return {'ok': False, 'svg': '', 'spec': {}, 'error': err or '没有可用的解析内容',
+                    'from_cache': False}
+
+    payload = json.dumps({'spec': spec, 'fallback': fallback, 'error': err}, ensure_ascii=False)
+    with _conn() as conn:
+        conn.execute('UPDATE quiz_items SET diagram_json=? WHERE id=?', (payload, item_id))
+    return {'ok': True, 'svg': diagram.render_svg(spec), 'spec': spec,
+            'error': err, 'from_cache': False, 'fallback': fallback}
+
+
+def _gen_one_offline(item: dict) -> dict:
+    """只调 AI 拿结构, 不碰数据库(并发安全)。失败则本地降级。"""
+    import diagram
+    res = diagram.build_spec(item.get('stem') or '', item.get('answer') or '',
+                             item.get('explain') or '', item.get('subject') or '数学')
+    if res['ok']:
+        return {'id': item['id'], 'spec': res['spec'], 'fallback': False, 'error': ''}
+    spec = diagram.build_fallback_spec(item.get('stem') or '', item.get('answer') or '',
+                                       item.get('explain') or '', item.get('topic') or '')
+    return {'id': item['id'], 'spec': spec, 'fallback': True,
+            'error': res.get('error', 'AI 未返回可用结构')}
+
+
+def gen_diagrams_for_paper(pid: int, max_n: int = MAX_DIAGRAMS_PER_PAPER,
+                           workers: int = 4, on_done=None) -> dict:
+    """
+    判卷后给错题批量画图。
+    并发只发生在 AI 调用上, 写库统一回到当前线程 —— SQLite 一条连接不能跨线程写。
+    返回 {'ok','failed','skipped','errors':[...]}
+    """
+    data = get_paper(pid)
+    wrong = [it for it in data.get('items', []) if it.get('correct') != 1]
+    todo, skipped = [], 0
+    for it in wrong:
+        if _cached_spec(it):
+            skipped += 1
+        else:
+            todo.append(it)
+    over = max(0, len(todo) - max_n)      # 超出一轮上限的, 留着让用户单独点
+    todo = todo[:max_n]
+    if not todo:
+        return {'ok': 0, 'failed': 0, 'skipped': skipped + over, 'errors': []}
+
+    results, errors = [], []
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            futs = {ex.submit(_gen_one_offline, it): it for it in todo}
+            for fut in as_completed(futs):
+                try:
+                    results.append(fut.result())
+                    if on_done:
+                        on_done(len(results), len(todo))
+                except Exception as e:
+                    errors.append(f'{futs[fut].get("uid")}: {e}')
+    except Exception as e:
+        # 并发不可用时退化为串行, 不能因为一个线程池问题就完全不出图
+        errors.append(f'并发出错, 改用串行: {e}')
+        for it in todo:
+            try:
+                results.append(_gen_one_offline(it))
+            except Exception as e2:
+                errors.append(f'{it.get("uid")}: {e2}')
+
+    with _conn() as conn:
+        for r in results:
+            if not r.get('spec'):
+                continue
+            payload = json.dumps({'spec': r['spec'], 'fallback': r['fallback'],
+                                  'error': r.get('error', '')}, ensure_ascii=False)
+            conn.execute('UPDATE quiz_items SET diagram_json=? WHERE id=?', (payload, r['id']))
+
+    ok = len([r for r in results if r.get('spec')])
+    return {'ok': ok, 'failed': len(results) - ok + len(errors), 'skipped': skipped + over,
+            'errors': errors[:5]}
+
+
+def attach_diagram_to_mistake(mistake_id: int, item_id: int) -> bool:
+    """把已画好的图挂到错题本记录上"""
+    row = get_item(item_id)
+    raw = row.get('diagram_json')
+    if not raw:
+        return False
+    with db.get_conn() as conn:
+        conn.execute('UPDATE mistakes SET diagram_json=? WHERE id=?', (raw, mistake_id))
+    return True
+
+
+def sync_diagrams_to_mistakes(pairs) -> int:
+    """判卷后: 把刚画好的图同步到对应的错题本记录, 免得错题本里还是没图"""
+    n = 0
+    for mid, iid in (pairs or []):
+        try:
+            if attach_diagram_to_mistake(mid, iid):
+                n += 1
         except Exception:
             continue
     return n
+
+
+def render_mistake_diagram(mistake: dict) -> str:
+    """错题本里的记录 -> SVG。没图就返回空串(调用方负责显示按钮)"""
+    import diagram
+    raw = (mistake or {}).get('diagram_json')
+    if not raw:
+        return ''
+    try:
+        d = json.loads(raw)
+        spec = d.get('spec') if isinstance(d, dict) else None
+        return diagram.render_svg(spec) if spec else ''
+    except Exception:
+        return ''
+
+
+def gen_diagram_for_mistake(mistake_id: int, force: bool = False) -> dict:
+    """
+    给错题本里的一条记录画讲解图。
+    拍照录入的错题没有 quiz_items 记录, 只能按 mistakes 自己的字段生成。
+    """
+    import diagram
+    with db.get_conn() as conn:
+        row = conn.execute('SELECT * FROM mistakes WHERE id=?', (mistake_id,)).fetchone()
+    if not row:
+        return {'ok': False, 'svg': '', 'spec': {}, 'error': '错题不存在'}
+    m = dict(row)
+    if not force and m.get('diagram_json'):
+        svg = render_mistake_diagram(m)
+        if svg:
+            return {'ok': True, 'svg': svg, 'spec': {}, 'error': '', 'from_cache': True}
+
+    res = diagram.build_spec(m.get('question') or '', m.get('correct_answer') or '',
+                             m.get('explanation') or '', m.get('subject') or '数学')
+    fallback, err = False, ''
+    if res['ok']:
+        spec = res['spec']
+    else:
+        spec = diagram.build_fallback_spec(m.get('question') or '', m.get('correct_answer') or '',
+                                           m.get('explanation') or '', m.get('title') or '')
+        fallback, err = True, res.get('error', '')
+        if not spec:
+            return {'ok': False, 'svg': '', 'spec': {}, 'error': err or '这道题没有解析，画不了图'}
+    payload = json.dumps({'spec': spec, 'fallback': fallback, 'error': err}, ensure_ascii=False)
+    with db.get_conn() as conn:
+        conn.execute('UPDATE mistakes SET diagram_json=? WHERE id=?', (payload, mistake_id))
+    return {'ok': True, 'svg': diagram.render_svg(spec), 'spec': spec,
+            'error': err, 'from_cache': False, 'fallback': fallback}
 
 
 def list_papers(subject: str = None, limit: int = 20) -> list:

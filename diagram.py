@@ -1,0 +1,568 @@
+# -*- coding: utf-8 -*-
+"""
+错题「思维导图」生成器。
+
+分工:
+  AI 只负责产出结构化数据 (解题主线 / 已知条件 / 关键判断 / 分情况 / 逐条结论);
+  图由本地固定模板渲染成 SVG, 不让 AI 写任意代码。
+
+这样做的原因:
+  1. 渲染可预期 —— 模板固定, 不会出现 AI 画的框叠在一起、字跑出框
+  2. 可离线降级 —— AI 不可用时, 用题干+解析本地拼一张「解题步骤图」, 而不是没有图
+  3. 无渲染风险 —— 不让 AI 输出 HTML/SVG 直插页面
+"""
+import json
+import re
+from html import escape
+
+# ============== 视觉常量 (对齐家长提供的样图风格) ==============
+C_TEXT = '#2F3B48'
+C_TEXT_DIM = '#5A6876'
+C_BOX_FILL = '#F0F3F7'
+C_BOX_STROKE = '#C9D4E0'
+C_KEY_FILL = '#DCEAF7'
+C_KEY_STROKE = '#7FAFD9'
+C_LINE = '#9AAFC2'
+C_AXIS = '#3C4B5A'
+C_AB = '#2E6BA8'
+C_BC = '#2A9D9A'
+C_OK_FILL = '#E7F5EC'
+C_OK_STROKE = '#8CC9A3'
+C_BAD_FILL = '#FBEAE7'
+C_BAD_STROKE = '#DFA398'
+C_SUM_FILL = '#DCEAF7'
+FONT = "'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
+
+W = 800
+PAD = 30
+
+
+# ============== 文字宽度估算与折行 ==============
+def _w(ch: str) -> float:
+    """单字符显示宽度(以中文字宽为 1)"""
+    if '\u4e00' <= ch <= '\u9fff' or ch in '，。；：（）、“”‘’！？':
+        return 1.0
+    if ch in 'il|.,:;!()[]\' ':
+        return 0.32
+    if ch.isupper() or ch in 'mwMW@':
+        return 0.72
+    return 0.56
+
+
+def text_width(s: str, size: float) -> float:
+    return sum(_w(c) for c in str(s)) * size
+
+
+def wrap(text: str, max_px: float, size: float, max_lines: int = 4) -> list:
+    """按像素宽度折行, 超出 max_lines 的行末加省略号"""
+    text = str(text or '').strip()
+    if not text:
+        return []
+    limit = max_px / size          # 折成多少个"中文字宽"
+    lines, cur, acc = [], '', 0.0
+    for ch in text:
+        cw = _w(ch)
+        if acc + cw > limit and cur:
+            lines.append(cur)
+            cur, acc = ch, cw
+        else:
+            cur += ch
+            acc += cw
+    if cur:
+        lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:-1] + '…'
+    return lines
+
+
+def fit(text: str, max_px: float, size: float) -> str:
+    """单行, 超长截断"""
+    text = str(text or '')
+    if text_width(text, size) <= max_px:
+        return text
+    out = ''
+    for ch in text:
+        if text_width(out + ch + '…', size) > max_px:
+            return out + '…'
+        out += ch
+    return out
+
+
+# ============== SVG 基元 ==============
+def _rect(x, y, w, h, fill, stroke, rx=8, sw=1.2, op=1.0):
+    return (f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{rx}" '
+            f'fill="{fill}" fill-opacity="{op}" stroke="{stroke}" stroke-width="{sw}"/>')
+
+
+def _text(x, y, s, size=13, color=C_TEXT, anchor='start', weight='normal'):
+    return (f'<text x="{x:.1f}" y="{y:.1f}" font-family="{FONT}" font-size="{size}" '
+            f'fill="{color}" text-anchor="{anchor}" font-weight="{weight}">{escape(str(s))}</text>')
+
+
+def _arrow(x1, y1, x2, y2, color=C_LINE):
+    """水平箭头"""
+    head = 5.5
+    return (f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2 - head:.1f}" y2="{y2:.1f}" '
+            f'stroke="{color}" stroke-width="1.4"/>'
+            f'<path d="M{x2 - head:.1f},{y1 - 3.6:.1f} L{x2:.1f},{y2:.1f} L{x2 - head:.1f},{y1 + 3.6:.1f} Z" '
+            f'fill="{color}"/>')
+
+
+def _check(x, y, size=13, ok=True):
+    color = '#2E8B57' if ok else '#C0504D'
+    if ok:
+        return (f'<path d="M{x:.1f},{y + size * 0.52:.1f} l{size * 0.3:.1f},{size * 0.34:.1f} '
+                f'l{size * 0.54:.1f},{-size * 0.72:.1f}" fill="none" stroke="{color}" '
+                f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>')
+    return (f'<path d="M{x:.1f},{y + size * 0.2:.1f} l{size * 0.7:.1f},{size * 0.7:.1f} '
+            f'M{x + size * 0.7:.1f},{y + size * 0.2:.1f} l{-size * 0.7:.1f},{size * 0.7:.1f}" '
+            f'fill="none" stroke="{color}" stroke-width="2" stroke-linecap="round"/>')
+
+
+def _num(v, default=None):
+    try:
+        f = float(v)
+        if f != f or f in (float('inf'), float('-inf')):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_num(x: float) -> str:
+    return str(int(x)) if abs(x - round(x)) < 1e-9 else f'{x:g}'
+
+
+# ============== spec 清洗: AI 输出不可信, 一律过一遍 ==============
+def sanitize_spec(raw, fallback_title='') -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    layout = str(raw.get('layout') or '').strip()
+    if layout not in ('case_split', 'steps', 'verdict_list'):
+        layout = 'verdict_list' if raw.get('verdicts') else ('case_split' if raw.get('cases') else 'steps')
+
+    def _strs(v, n, maxpx):
+        out = []
+        for x in (v or [])[:n]:
+            s = str(x or '').strip()
+            if s:
+                out.append(fit(s, maxpx, 11.5))
+        return out
+
+    cases = []
+    for c in (raw.get('cases') or [])[:3]:
+        if not isinstance(c, dict):
+            continue
+        pts = []
+        for p in (c.get('points') or [])[:4]:
+            if not isinstance(p, dict):
+                continue
+            x = _num(p.get('x'))
+            if x is None:
+                continue
+            name = str(p.get('name') or '').strip()[:6]
+            if name:
+                pts.append({'name': name, 'x': x})
+        # 数轴至少要 2 个点才有意义
+        if len(pts) < 2:
+            pts = []
+        segs = []
+        names = {p['name'] for p in pts}
+        for s in (c.get('segments') or [])[:3]:
+            if not isinstance(s, dict):
+                continue
+            f, t = str(s.get('from') or '').strip(), str(s.get('to') or '').strip()
+            if f in names and t in names and f != t:
+                segs.append({'label': str(s.get('label') or f'{f}{t}').strip()[:10],
+                             'from': f, 'to': t,
+                             'style': 'ab' if str(s.get('color') or '').lower() in ('blue', 'ab') else 'bc'})
+        cases.append({
+            'label': str(c.get('label') or '').strip()[:24],
+            'note': fit(str(c.get('note') or '').strip(), 700, 11),
+            'points': pts,
+            'segments': segs,
+            'conclusion': fit(str(c.get('conclusion') or '').strip(), 700, 11.5),
+        })
+
+    verdicts = []
+    for v in (raw.get('verdicts') or [])[:6]:
+        if not isinstance(v, dict):
+            continue
+        txt = str(v.get('text') or '').strip()
+        if not txt:
+            continue
+        verdicts.append({'no': str(v.get('no') or '').strip()[:3],
+                         'text': fit(txt, 108, 11.5),
+                         'ok': bool(v.get('ok'))})
+
+    steps = []
+    for s in (raw.get('steps') or [])[:5]:
+        s = str(s or '').strip()
+        if s:
+            steps.append(fit(s, 240, 11.5))
+
+    return {
+        'layout': layout,
+        'title': fit(str(raw.get('title') or fallback_title or '解题思路').strip(), 740, 15),
+        'known': _strs(raw.get('known'), 3, 200),
+        'keys': _strs(raw.get('keys'), 3, 200),
+        'cases': cases,
+        'verdicts': verdicts,
+        'steps': steps,
+        'answer': fit(str(raw.get('answer') or '').strip(), 620, 13),
+    }
+
+
+# ============== 数轴渲染 ==============
+def _render_axis(pts, segs, x0, y, width) -> str:
+    """
+    垂直布局(参考样图):
+        y-11 / y-25  点名(坐标) —— 两点过近时上下错层, 避免叠字
+        y            数轴
+        y+9 / y+31   两条长度带
+        y+23 / y+45  长度标签
+    """
+    xs = [p['x'] for p in pts]
+    lo, hi = min(xs), max(xs)
+    if hi - lo < 1e-9:
+        return ''
+    # 两端各留 40px: 端点标签(如 "C(-5)") 才不会跑出画布
+    edge = 40
+    inner_l, inner_r = x0 + edge, x0 + width - edge
+    span = hi - lo
+    def px(v):
+        return inner_l + (v - lo) / span * (inner_r - inner_l)
+
+    out = [f'<line x1="{x0:.1f}" y1="{y:.1f}" x2="{x0 + width:.1f}" y2="{y:.1f}" '
+           f'stroke="{C_AXIS}" stroke-width="1.1"/>']
+    rx_ = x0 + width
+    out.append(f'<path d="M{rx_ - 5:.1f},{y - 3:.1f} L{rx_:.1f},{y:.1f} '
+               f'L{rx_ - 5:.1f},{y + 3:.1f} Z" fill="{C_AXIS}"/>')
+
+    # 零点: 只画淡竖线做参照, 不写文字(点的坐标已标出, 避免与标签抢位置)
+    if lo < 0 < hi:
+        zx = px(0)
+        out.append(f'<line x1="{zx:.1f}" y1="{y - 8:.1f}" x2="{zx:.1f}" y2="{y + 8:.1f}" '
+                   f'stroke="#C6D0DA" stroke-width="1.4" stroke-dasharray="3 3"/>')
+
+    by_name = {p['name']: p for p in pts}
+    # 两条长度带错开在轴下方, 标签各在带下方
+    bands = [('ab', y + 9), ('bc', y + 31)]
+    for style, yy in bands:
+        for s in segs:
+            if s['style'] != style:
+                continue
+            a, b = by_name[s['from']], by_name[s['to']]
+            xa, xb = px(a['x']), px(b['x'])
+            color = C_AB if style == 'ab' else C_BC
+            l, r = min(xa, xb), max(xa, xb)
+            out.append(f'<line x1="{l:.1f}" y1="{yy:.1f}" x2="{r:.1f}" y2="{yy:.1f}" '
+                       f'stroke="{color}" stroke-width="2.4" stroke-linecap="round" opacity="0.9"/>')
+            for xx in (l, r):
+                out.append(f'<line x1="{xx:.1f}" y1="{yy - 4.5:.1f}" x2="{xx:.1f}" y2="{yy + 4.5:.1f}" '
+                           f'stroke="{color}" stroke-width="1.6"/>')
+            out.append(_text((l + r) / 2, yy + 14, s['label'], 10.5, color, 'middle', '600'))
+
+    # 点 + 标签(坐标与名字合并, 过近则错层)
+    last_x = -999.0
+    layer = 0
+    for p in sorted(pts, key=lambda z: z['x']):
+        x = px(p['x'])
+        if x - last_x < 52:
+            layer = 1 - layer
+        else:
+            layer = 0
+        last_x = x
+        ly = y - 11 - layer * 14
+        out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.4" fill="{C_AXIS}"/>')
+        label = f"{p['name']}({_fmt_num(p['x'])})"
+        out.append(_text(x, ly, label, 11, C_TEXT, 'middle', '600'))
+    return ''.join(out)
+
+
+# ============== 自动补"对照数轴" ==============
+_POINTS_RE = re.compile(
+    r'\(\s*a\s*,\s*b\s*,\s*c\s*\)\s*=\s*\(\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*\)')
+
+
+def fill_compare_axis(spec: dict, question: str = '') -> dict:
+    """
+    AI 常只给"满足条件"的那种情形画数轴, 另一种只给一组数 —— 家长要的是能对照的图。
+    若题目明确提到了数轴上的 A(a)/B(b)/C(c), 且这一种情形已写明 (a,b,c)=(x,y,z),
+    就按这三个数补一条数轴和 AB/BC 长度, 让学生自己看出长短反过来了。
+    只在至少已有一种情形画了数轴时才补, 避免把纯代数题硬画成数轴。
+    """
+    cases = (spec or {}).get('cases') or []
+    q = question or ''
+    if not cases or not any(c['points'] for c in cases):
+        return spec
+    if not (('数轴' in q) or ('A(a)' in q.replace(' ', '')) or ('AB' in q) or ('BC' in q)):
+        return spec
+    for c in cases:
+        if c['points']:
+            continue
+        m = _POINTS_RE.search(c.get('note') or '')
+        if not m:
+            continue
+        a, b, cc = (float(x) for x in m.groups())
+        c['points'] = [{'name': 'C', 'x': cc}, {'name': 'B', 'x': b}, {'name': 'A', 'x': a}]
+        c['segments'] = [
+            {'label': f'AB = {_fmt_num(abs(a - b))}', 'from': 'B', 'to': 'A', 'style': 'ab'},
+            {'label': f'BC = {_fmt_num(abs(b - cc))}', 'from': 'C', 'to': 'B', 'style': 'bc'},
+        ]
+        ab, bc = abs(a - b), abs(b - cc)
+        rel = 'AB > BC' if ab > bc else ('AB < BC' if ab < bc else 'AB = BC')
+        old = (c.get('conclusion') or '').strip()
+        if not old:
+            c['conclusion'] = f'{rel}（与另一种情形对照）'
+        elif ('AB' not in old) and ('BC' not in old):
+            # 原来只写了别的结论, 补上这条对照, 否则补出来的数轴没有落点
+            c['conclusion'] = fit(f'{old}；对照 {rel}', 700, 11.5)
+    return spec
+
+
+# ============== 主渲染 ==============
+def render_svg(spec: dict, foot_note: str = '') -> str:
+    """把 spec 渲染成 SVG 字符串。spec 需已过 sanitize_spec。"""
+    if not spec:
+        return ''
+    parts, y = [], 0
+
+    # --- 标题 ---
+    y += 8
+    if spec.get('title'):
+        parts.append(_text(W / 2, y + 15, spec['title'], 15, C_TEXT, 'middle', '700'))
+        y += 28
+
+    # --- 顶部三框 ---
+    known, keys = spec.get('known') or [], spec.get('keys') or []
+    cases = spec.get('cases') or []
+    verdicts = spec.get('verdicts') or []
+
+    if known or keys:
+        box_w, gap = 220, 40
+        heads = ['已知条件', '先锁死关键', '']
+        bodies = [known, keys, []]
+        if cases:
+            heads[2] = '只需分这几种情形'
+            shorts = []
+            for c in cases:
+                lb = c['label']
+                for sep in ('：', ':'):
+                    if sep in lb:
+                        lb = lb.split(sep, 1)[1]
+                        break
+                shorts.append(fit(lb.strip(), 190, 11.5))
+            bodies[2] = shorts or [f'共 {len(cases)} 种']
+        elif verdicts:
+            heads[2] = '逐条判定'
+            bodies[2] = [f'共 {len(verdicts)} 条结论']
+        else:
+            heads[2] = '按步骤推'
+            bodies[2] = [f'共 {len(spec.get("steps") or [])} 步'] if spec.get('steps') else []
+
+        # 估高
+        line_h, head_h, pad_v = 15.5, 20, 11
+        n_lines = max(len(b) for b in bodies) if any(bodies) else 1
+        n_lines = max(n_lines, 1)
+        box_h = head_h + n_lines * line_h + pad_v * 2
+
+        xs = [PAD + i * (box_w + gap) for i in range(3)]
+        for i in range(3):
+            fill, stroke = (C_KEY_FILL, C_KEY_STROKE) if i == 1 else (C_BOX_FILL, C_BOX_STROKE)
+            parts.append(_rect(xs[i], y, box_w, box_h, fill, stroke))
+            parts.append(_text(xs[i] + box_w / 2, y + pad_v + 13, heads[i], 12.5,
+                               C_TEXT_DIM if i != 1 else '#2A5D8F', 'middle', '600'))
+            ty = y + pad_v + 13 + 17
+            for ln in (bodies[i] or [])[:4]:
+                for wl in (wrap(ln, box_w - 24, 11.5, 2) if text_width(ln, 11.5) > box_w - 24 else [ln])[:2]:
+                    parts.append(_text(xs[i] + box_w / 2, ty, wl, 11.5, C_TEXT, 'middle'))
+                    ty += line_h
+            # 箭头
+            if i < 2:
+                ax1, ax2 = xs[i] + box_w + 6, xs[i + 1] - 6
+                parts.append(_arrow(ax1, y + box_h / 2, ax2, y + box_h / 2))
+        y += box_h + 18
+
+    # --- 分情况: 每情况一条数轴 ---
+    for idx, c in enumerate(cases):
+        # 情形标题; 右侧说明按剩余宽度折行, 不够宽就另起一行(避免和标题叠字)
+        parts.append(_text(PAD, y + 13, c['label'], 12.5, '#2A5D8F', 'start', '700'))
+        if c['note']:
+            room = W - PAD * 2 - text_width(c['label'], 12.5) - 16
+            if room >= text_width('(a,b,c)=(7,-2,-5)', 11):
+                parts.append(_text(W - PAD, y + 13, c['note'], 11, C_TEXT_DIM, 'end'))
+            else:
+                y += 16
+                parts.append(_text(PAD + 2, y + 13, c['note'], 11, C_TEXT_DIM, 'start'))
+        y += 22
+        # 数轴
+        if c['points']:
+            axis_y = y + 26
+            parts.append(_render_axis(c['points'], c['segments'], PAD + 4, axis_y, W - PAD * 2 - 8))
+            y = axis_y + (50 if c['segments'] else 14)
+        else:
+            # 没有可画的数轴(如"两点重合"只有一个点): 也要让出 note 那一行, 否则结论会压上去
+            y += 6
+        # 结论
+        if c['conclusion']:
+            parts.append(_text(W - PAD, y + 6, '→ ' + c['conclusion'], 11.5, C_AB, 'end', '600'))
+            y += 22
+        # 分隔线
+        if idx < len(cases) - 1:
+            parts.append(f'<line x1="{PAD}" y1="{y + 4:.1f}" x2="{W - PAD}" y2="{y + 4:.1f}" '
+                         f'stroke="#E2E8EF" stroke-width="1" stroke-dasharray="4 4"/>')
+            y += 16
+
+    # --- 逐条结论 ---
+    if verdicts:
+        y += 6
+        n = len(verdicts)
+        per_row = n if n <= 5 else 3
+        gap = 12
+        vw = (W - PAD * 2 - gap * (per_row - 1)) / per_row
+        vh = 48
+        for i, v in enumerate(verdicts):
+            row, col = divmod(i, per_row)
+            x = PAD + col * (vw + gap)
+            yy = y + row * (vh + 10)
+            fill, stroke = (C_OK_FILL, C_OK_STROKE) if v['ok'] else (C_BAD_FILL, C_BAD_STROKE)
+            parts.append(_rect(x, yy, vw, vh, fill, stroke, rx=7))
+            parts.append(_text(x + 10, yy + 17, (v['no'] + ' ' if v['no'] else '') + v['text'],
+                               11.5, C_TEXT, 'start'))
+            mark = '✓ 正确' if v['ok'] else '✗ 错误'
+            parts.append(_text(x + vw - 10, yy + 35, mark, 11.5,
+                               '#2E8B57' if v['ok'] else '#C0504D', 'end', '600'))
+        rows = (len(verdicts) + per_row - 1) // per_row
+        y += rows * (vh + 10)
+
+    # --- 步骤(无 cases/verdicts 时) ---
+    if not cases and not verdicts and spec.get('steps'):
+        parts.append(_text(PAD, y + 12, '解题步骤', 12, C_TEXT_DIM, 'start', '600'))
+        y += 22
+        for i, s in enumerate(spec['steps']):
+            bx, bw = PAD + 34, W - PAD * 2 - 34
+            bh = 30
+            parts.append(_rect(bx, y, bw, bh, C_BOX_FILL, C_BOX_STROKE, rx=6))
+            parts.append(f'<circle cx="{PAD + 16}" cy="{y + bh / 2:.1f}" r="11" fill="{C_KEY_FILL}" '
+                         f'stroke="{C_KEY_STROKE}" stroke-width="1.2"/>')
+            parts.append(_text(PAD + 16, y + bh / 2 + 4, str(i + 1), 11.5, '#2A5D8F', 'middle', '700'))
+            parts.append(_text(bx + 12, y + bh / 2 + 4, s, 11.5, C_TEXT))
+            y += bh + 8
+            if i < len(spec['steps']) - 1:
+                parts.append(f'<line x1="{PAD + 16}" y1="{y - 8:.1f}" x2="{PAD + 16}" y2="{y + 1:.1f}" '
+                             f'stroke="{C_KEY_STROKE}" stroke-width="1.4"/>')
+        y += 4
+
+    # --- 汇总结论 ---
+    if spec.get('answer'):
+        y += 10
+        label = '结论: ' + spec['answer']
+        bw = min(W - PAD * 2, text_width(label, 13) + 56)
+        bx = (W - bw) / 2
+        parts.append(_rect(bx, y, bw, 38, C_SUM_FILL, C_KEY_STROKE, rx=9, sw=1.4))
+        parts.append(_text(W / 2, y + 24, label, 13, '#1F4B75', 'middle', '700'))
+        y += 38
+
+    if foot_note:
+        y += 14
+        parts.append(_text(W / 2, y, foot_note, 10.5, C_TEXT_DIM, 'middle'))
+        y += 6
+
+    H = y + PAD
+    head = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H:.0f}" '
+            f'width="100%" style="max-width:{W}px;height:auto">'
+            f'<rect x="0" y="0" width="{W}" height="{H:.0f}" fill="#FFFFFF"/>')
+    return head + ''.join(parts) + '</svg>'
+
+
+# ============== AI 产出结构 ==============
+_SPEC_SYSTEM = """你是初中数学老师的板书设计师。给你一道题、正确答案和解析，你要输出一张「解题思维导图」的结构化数据。
+你不画图，只输出 JSON；程序会用固定模板把 JSON 画成图。字段必须严格遵守。
+
+输出格式：
+{
+  "layout": "case_split" | "steps" | "verdict_list",
+  "title": "一句话点出这题的解法主线，不超过 18 字",
+  "known": ["已知条件1", "已知条件2"],
+  "keys": ["由已知推出的关键判断1"],
+  "cases": [
+    {
+      "label": "情形一：b<0",
+      "note": "取一组满足条件的数 (a,b,c)=(7,-2,-5)",
+      "points": [{"name":"C","x":-5},{"name":"B","x":-2},{"name":"A","x":7}],
+      "segments": [{"label":"AB = 9","from":"B","to":"A","color":"blue"},
+                   {"label":"BC = 3","from":"C","to":"B","color":"teal"}],
+      "conclusion": "AB > BC 成立"
+    }
+  ],
+  "verdicts": [{"no":"①","text":"ac<0","ok":true}],
+  "steps": ["第1步的文字", "第2步的文字"],
+  "answer": "最终结论，如 ①②③⑤正确，共4个 → 选 C"
+}
+
+选择规则（重要，按顺序判断）：
+1. 题目里有 ① ② ③ 这类需要逐条判断真假的结论 —— verdicts 必须全部填上，ok 按真实对错填，不许全 true。
+   如果这些结论里还需要分情况讨论（符号未定 / 位置未定 / 绝对值 / 动点），layout 用 "case_split"，
+   并把 cases 也填上（这正是最有价值的部分）；否则 layout 用 "verdict_list"，cases 留空数组。
+2. 只有一条解法路径的计算题、化简题、解方程题 —— layout 用 "steps"，steps 填 3~5 步，
+   每步写清"做了什么 + 算出什么"。cases 和 verdicts 留空数组。
+3. 需要按不同情况分别讨论，但不需要逐条判断结论 —— layout 用 "case_split"，verdicts 留空数组。
+
+硬性要求：
+- 题目只要涉及数轴上的点（A、B、C 或 P、Q）的距离、线段长短比较，则**每一个情形都必须给出 points 和 segments**。
+  不合格的反例：只给"满足条件"的情形画数轴，"不满足"的情形留空 —— 那样就看不出这个条件为什么必要。
+  正确做法：两种情形都画出数轴，让学生自己看出长短关系反过来了。
+- points 的 x 必须是你举的那组例子的真实数值，且与 note 里写的完全一致，不许编。
+- segments 的 from/to 必须是 points 里出现过的 name。
+- 数轴只在该情形需要比较线段长短（AB、BC 这类）时才填；纯代数计算、跟数轴无关的情形，points 和 segments 都留空数组。
+- note 只写"这一情形取哪组数"，不要写结论判断；结论一律写进 conclusion。
+- known 必须是题干原意的直述，不要掺入推导结果。
+- 每个文字字段尽量短：known/keys 每条不超过 18 字，conclusion 不超过 30 字，verdicts.text 不超过 12 字。
+- 全中文，用初中生能看懂的话，不要出现"显然""易得"这类词。
+- 只输出 JSON，不要任何解释。"""
+
+
+def build_spec(question: str, answer: str, explain: str, subject: str = '数学') -> dict:
+    """
+    调用 AI 产出图解结构。返回 {'ok':bool, 'spec':dict, 'error':str}
+    这是唯一需要联网的环节; 失败时调用方应回退到 build_fallback_spec()。
+    """
+    import llm
+    if not llm.is_llm_enabled():
+        return {'ok': False, 'spec': {}, 'error': 'AI 老师未配置，无法生成图解'}
+    user = ('科目：%s\n题目：%s\n\n正确答案：%s\n\n解析：%s\n\n请输出图解 JSON。'
+            % (subject, question, answer, explain or '（无解析，请你自己推导一遍）'))
+    raw = llm._call_chat(_SPEC_SYSTEM, user, json_mode=True)
+    if not isinstance(raw, dict) or raw.get('error'):
+        return {'ok': False, 'spec': {}, 'error': str((raw or {}).get('error') or 'AI 没有返回内容')}
+    spec = sanitize_spec(raw, fallback_title='解题思路')
+    if not spec or not (spec.get('cases') or spec.get('verdicts')
+                        or spec.get('steps') or spec.get('answer')):
+        return {'ok': False, 'spec': {}, 'error': 'AI 返回的内容不完整，没法画图'}
+    spec = fill_compare_axis(spec, question)
+    return {'ok': True, 'spec': spec, 'error': ''}
+
+
+def build_fallback_spec(question: str, answer: str, explain: str, topic: str = '') -> dict:
+    """
+    AI 不可用时的本地降级: 不联网, 把解析按句拆成步骤图。
+    宁可给一张朴素的步骤图, 也不让孩子看到一个空白区域。
+    """
+    steps = []
+    for seg in re.split(r'(?<=[。；;！!])', (explain or '').strip()):
+        seg = seg.strip(' 。；;')
+        if len(seg) >= 6:
+            steps.append(seg)
+    steps = steps[:5]
+    if not steps:
+        return {}
+    return sanitize_spec({
+        'layout': 'steps',
+        'title': (topic or '解题步骤'),
+        'known': [fit(question, 200, 11.5)] if question else [],
+        'keys': [],
+        'steps': steps,
+        'answer': str(answer or ''),
+    })

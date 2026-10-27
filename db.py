@@ -101,6 +101,8 @@ def init_db():
         conn.executescript(SCHEMA)
         # 兼容旧库: 字段不存在则追加. SQLite 没有 IF NOT EXISTS, 用 PRAGMA 兜底.
         _ensure_column(conn, 'mistakes', 'good_prompts', 'TEXT')
+        # 讲解思维导图: 存图解结构(JSON), 渲染很快, 所以存 spec 不存 SVG
+        _ensure_column(conn, 'mistakes', 'diagram_json', 'TEXT')
 
 
 def _ensure_column(conn, table: str, column: str, definition: str):
@@ -119,7 +121,8 @@ def add_mistake(subject, question, **kwargs):
     for k, v in kwargs.items():
         if v is not None and k in ('grade', 'title', 'answer', 'correct_answer',
                                      'explanation', 'wrong_reason',
-                                     'knowledge_id', 'image_path', 'source'):
+                                     'knowledge_id', 'image_path', 'source',
+                                     'diagram_json'):
             fields.append(k)
             placeholders.append('?')
             values.append(v)
