@@ -36,6 +36,9 @@ FONT = "'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
 W = 800
 PAD = 30
 
+# 结构版本: 老版本(没有错点定位)的图会被判为过期并重画, 免得孩子看到一张不带红标的旧图
+SPEC_VER = 2
+
 
 # ============== 文字宽度估算与折行 ==============
 def _w(ch: str) -> float:
@@ -199,8 +202,28 @@ def sanitize_spec(raw, fallback_title='') -> dict:
     steps = []
     for s in (raw.get('steps') or [])[:5]:
         s = str(s or '').strip()
+        # 模板左侧已经有序号, AI 又爱写"第2步：", 剥掉免得重复
+        s = re.sub(r'^第\s*[0-9一二三四五六七八九]\s*步\s*[:：.、,，]?\s*', '', s).strip()
         if s:
             steps.append(fit(s, 240, 11.5))
+
+    # --- 错点定位: 孩子答错了才画红框; AI 有时塞字符串进来, 一律按 dict 处理 ---
+    m_raw = raw.get('mistake')
+    if not isinstance(m_raw, dict):
+        m_raw = {}
+    # 长度上限按"卡片实际可用宽度"给: 卡片宽 740-28, why/fix 可折到 3 行, 不要提前截成一句话
+    my = fit(str(m_raw.get('my') or '').strip(), 360, 12)
+    at = fit(str(m_raw.get('at') or m_raw.get('where') or '').strip(), 200, 12)
+    why = fit(str(m_raw.get('why') or '').strip(), 660, 11.5)
+    fix = fit(str(m_raw.get('fix') or '').strip(), 660, 11.5)
+    st_i = _num(m_raw.get('step'))
+    if st_i is not None:
+        st_i = int(st_i)
+        if not (1 <= st_i <= max(1, len(steps))):
+            st_i = None
+    mistake = {}
+    if my or at or why:
+        mistake = {'my': my, 'at': at, 'why': why, 'fix': fix, 'step': st_i}
 
     return {
         'layout': layout,
@@ -211,6 +234,8 @@ def sanitize_spec(raw, fallback_title='') -> dict:
         'verdicts': verdicts,
         'steps': steps,
         'answer': fit(str(raw.get('answer') or '').strip(), 620, 13),
+        'mistake': mistake,
+        'v': SPEC_VER,
     }
 
 
@@ -322,6 +347,51 @@ def fill_compare_axis(spec: dict, question: str = '') -> dict:
     return spec
 
 
+# ============== 错点卡片(红色, 固定画在图最下方) ==============
+def _render_mistake_card(mis: dict, x: float, y: float, width: float):
+    """返回 (svg片段列表, 卡片高度)。没有内容则返回 ([], 0)。"""
+    if not mis:
+        return [], 0
+    my = str(mis.get('my') or '').strip()
+    at = str(mis.get('at') or '').strip()
+    why = str(mis.get('why') or '').strip()
+    fix = str(mis.get('fix') or '').strip()
+    if not (my or at or why or fix):
+        return [], 0
+
+    inner = width - 28
+    line_h = 16.5
+    parts = []
+    cy = y + 21                  # 当前行的基线(统一用基线推进, 别混用"高度累加", 否则必然叠字)
+
+    # 第 1 行: 左边红字标题, 右边"你答的是 X"(放不下就另起一行)
+    parts.append(_text(x + 14, cy, '❌ 你错在这里', 12.5, '#C0504D', 'start', '700'))
+    if my:
+        my_s = '你答的是：' + my
+        room = inner - text_width('❌ 你错在这里', 12.5) - 20
+        if text_width(my_s, 12) <= room:
+            parts.append(_text(x + width - 14, cy, my_s, 12, '#8A5A4A', 'end', '600'))
+        else:
+            cy += 18
+            parts.append(_text(x + 14, cy, fit(my_s, inner, 12), 12, '#8A5A4A', 'start', '600'))
+    cy += 20
+
+    if at:
+        parts.append(_text(x + 14, cy, '📍 错在：' + at, 12, '#C0504D', 'start', '700'))
+        cy += 18
+    if why:
+        for ln in wrap('为什么错：' + why, inner, 11.5, 3):
+            parts.append(_text(x + 14, cy, ln, 11.5, C_TEXT))
+            cy += line_h
+    if fix:
+        for ln in wrap('应该这样想：' + fix, inner, 11.5, 3):
+            parts.append(_text(x + 14, cy, ln, 11.5, '#2E8B57', 'start', '600'))
+            cy += line_h
+    # 最后一行的基线已在循环里推进过, 退回一行再算卡片底
+    h = (cy - line_h + 11) - y
+    return parts, h
+
+
 # ============== 主渲染 ==============
 def render_svg(spec: dict, foot_note: str = '') -> str:
     """把 spec 渲染成 SVG 字符串。spec 需已过 sanitize_spec。"""
@@ -386,11 +456,25 @@ def render_svg(spec: dict, foot_note: str = '') -> str:
         y += box_h + 18
 
     # --- 分情况: 每情况一条数轴 ---
+    _mis_at = (spec.get('mistake') or {}).get('at') or ''
+
+    def _case_is_bad(c):
+        """错点在这一情形吗? (label 全文命中或"情形二"这类标记命中)"""
+        lb = c.get('label') or ''
+        if not lb or not _mis_at:
+            return False
+        if lb in _mis_at or _mis_at in lb:
+            return True
+        m = re.search(r'情形\s*[一二三四五1-5]', lb)
+        return bool(m and m.group(0) in _mis_at)
+
     for idx, c in enumerate(cases):
         # 情形标题; 右侧说明按剩余宽度折行, 不够宽就另起一行(避免和标题叠字)
-        parts.append(_text(PAD, y + 13, c['label'], 12.5, '#2A5D8F', 'start', '700'))
+        _bad = _case_is_bad(c)
+        parts.append(_text(PAD, y + 13, ('✗ ' if _bad else '') + c['label'], 12.5,
+                           '#C0504D' if _bad else '#2A5D8F', 'start', '700'))
         if c['note']:
-            room = W - PAD * 2 - text_width(c['label'], 12.5) - 16
+            room = W - PAD * 2 - text_width(c['label'], 12.5) - 16 - (28 if _bad else 0)
             if room >= text_width('(a,b,c)=(7,-2,-5)', 11):
                 parts.append(_text(W - PAD, y + 13, c['note'], 11, C_TEXT_DIM, 'end'))
             else:
@@ -423,17 +507,28 @@ def render_svg(spec: dict, foot_note: str = '') -> str:
         gap = 12
         vw = (W - PAD * 2 - gap * (per_row - 1)) / per_row
         vh = 48
+        # 错点定位到某一条结论时(如 at="结论③"), 把那条标红: 只看底部卡片还不够直观
+        _at = (spec.get('mistake') or {}).get('at') or ''
+        _hits = [v['no'] for v in verdicts if v['no'] and v['no'] in _at]
+        bad_vno = _hits[0] if len(_hits) == 1 else None
         for i, v in enumerate(verdicts):
             row, col = divmod(i, per_row)
             x = PAD + col * (vw + gap)
             yy = y + row * (vh + 10)
+            is_bad = bool(bad_vno) and v['no'] == bad_vno
             fill, stroke = (C_OK_FILL, C_OK_STROKE) if v['ok'] else (C_BAD_FILL, C_BAD_STROKE)
             parts.append(_rect(x, yy, vw, vh, fill, stroke, rx=7))
             parts.append(_text(x + 10, yy + 17, (v['no'] + ' ' if v['no'] else '') + v['text'],
                                11.5, C_TEXT, 'start'))
             mark = '✓ 正确' if v['ok'] else '✗ 错误'
+            if is_bad:
+                # 再描一圈红边, 表示"孩子就是错在这一条"
+                parts.append(f'<rect x="{x - 1.5:.1f}" y="{yy - 1.5:.1f}" width="{vw + 3:.1f}" '
+                             f'height="{vh + 3:.1f}" rx="8" fill="none" stroke="#C0504D" '
+                             f'stroke-width="2.2"/>')
+                mark = '✗ 你错在这条'
             parts.append(_text(x + vw - 10, yy + 35, mark, 11.5,
-                               '#2E8B57' if v['ok'] else '#C0504D', 'end', '600'))
+                               '#2E8B57' if v['ok'] and not is_bad else '#C0504D', 'end', '600'))
         rows = (len(verdicts) + per_row - 1) // per_row
         y += rows * (vh + 10)
 
@@ -441,14 +536,25 @@ def render_svg(spec: dict, foot_note: str = '') -> str:
     if not cases and not verdicts and spec.get('steps'):
         parts.append(_text(PAD, y + 12, '解题步骤', 12, C_TEXT_DIM, 'start', '600'))
         y += 22
+        bad_step = (spec.get('mistake') or {}).get('step')
         for i, s in enumerate(spec['steps']):
+            is_bad = (bad_step == i + 1)
             bx, bw = PAD + 34, W - PAD * 2 - 34
             bh = 30
-            parts.append(_rect(bx, y, bw, bh, C_BOX_FILL, C_BOX_STROKE, rx=6))
-            parts.append(f'<circle cx="{PAD + 16}" cy="{y + bh / 2:.1f}" r="11" fill="{C_KEY_FILL}" '
-                         f'stroke="{C_KEY_STROKE}" stroke-width="1.2"/>')
-            parts.append(_text(PAD + 16, y + bh / 2 + 4, str(i + 1), 11.5, '#2A5D8F', 'middle', '700'))
+            fill, stroke = (C_BAD_FILL, C_BAD_STROKE) if is_bad else (C_BOX_FILL, C_BOX_STROKE)
+            parts.append(_rect(bx, y, bw, bh, fill, stroke, rx=6, sw=1.6 if is_bad else 1.2))
+            parts.append(f'<circle cx="{PAD + 16}" cy="{y + bh / 2:.1f}" r="11" '
+                         f'fill="{"#F6DAD4" if is_bad else C_KEY_FILL}" '
+                         f'stroke="{"#C0504D" if is_bad else C_KEY_STROKE}" stroke-width="1.2"/>')
+            if is_bad:
+                parts.append(_text(PAD + 16, y + bh / 2 + 4, '✗', 13, '#C0504D', 'middle', '700'))
+            else:
+                parts.append(_text(PAD + 16, y + bh / 2 + 4, str(i + 1), 11.5, '#2A5D8F', 'middle', '700'))
             parts.append(_text(bx + 12, y + bh / 2 + 4, s, 11.5, C_TEXT))
+            if is_bad:
+                # 步骤右侧打红标, 让孩子一眼看到错在第几步
+                parts.append(_text(bx + bw - 12, y + bh / 2 + 4, '← 错在这一步', 11.5,
+                                   '#C0504D', 'end', '700'))
             y += bh + 8
             if i < len(spec['steps']) - 1:
                 parts.append(f'<line x1="{PAD + 16}" y1="{y - 8:.1f}" x2="{PAD + 16}" y2="{y + 1:.1f}" '
@@ -465,6 +571,13 @@ def render_svg(spec: dict, foot_note: str = '') -> str:
         parts.append(_text(W / 2, y + 24, label, 13, '#1F4B75', 'middle', '700'))
         y += 38
 
+    # --- 错点定位(红色卡片, 画在最下方, 让孩子一眼看到自己错在哪一步) ---
+    _mp, _mh = _render_mistake_card(spec.get('mistake') or {}, PAD, y + 8, W - PAD * 2)
+    if _mp:
+        parts.append(_rect(PAD, y + 8, W - PAD * 2, _mh, C_BAD_FILL, C_BAD_STROKE, rx=9, sw=1.4))
+        parts.extend(_mp)
+        y += 8 + _mh
+
     if foot_note:
         y += 14
         parts.append(_text(W / 2, y, foot_note, 10.5, C_TEXT_DIM, 'middle'))
@@ -478,7 +591,7 @@ def render_svg(spec: dict, foot_note: str = '') -> str:
 
 
 # ============== AI 产出结构 ==============
-_SPEC_SYSTEM = """你是初中数学老师的板书设计师。给你一道题、正确答案和解析，你要输出一张「解题思维导图」的结构化数据。
+_SPEC_COMMON = """你是初中老师的板书设计师。给你一道题、孩子的答案、正确答案和解析，你要输出一张「讲解思维导图」的结构化数据。
 你不画图，只输出 JSON；程序会用固定模板把 JSON 画成图。字段必须严格遵守。
 
 输出格式：
@@ -487,22 +600,35 @@ _SPEC_SYSTEM = """你是初中数学老师的板书设计师。给你一道题�
   "title": "一句话点出这题的解法主线，不超过 18 字",
   "known": ["已知条件1", "已知条件2"],
   "keys": ["由已知推出的关键判断1"],
-  "cases": [
-    {
-      "label": "情形一：b<0",
-      "note": "取一组满足条件的数 (a,b,c)=(7,-2,-5)",
-      "points": [{"name":"C","x":-5},{"name":"B","x":-2},{"name":"A","x":7}],
-      "segments": [{"label":"AB = 9","from":"B","to":"A","color":"blue"},
-                   {"label":"BC = 3","from":"C","to":"B","color":"teal"}],
-      "conclusion": "AB > BC 成立"
-    }
-  ],
-  "verdicts": [{"no":"①","text":"ac<0","ok":true}],
+  "cases": [{"label":"情形一：b<0","note":"取哪组数","points":[],"segments":[],"conclusion":"这一情形的结论"}],
+  "verdicts": [{"no":"①","text":"结论文本","ok":true}],
   "steps": ["第1步的文字", "第2步的文字"],
-  "answer": "最终结论，如 ①②③⑤正确，共4个 → 选 C"
+  "answer": "最终结论",
+  "mistake": {
+    "my": "孩子实际写下的答案原文",
+    "at": "错在哪一步，如 第2步 / 情形二 / 结论③ / 审题",
+    "step": 2,
+    "why": "为什么会错，一句话不超过 30 字",
+    "fix": "正确的想法应该是什么，一句话不超过 30 字"
+  }
 }
 
-选择规则（重要，按顺序判断）：
+「mistake」是这张图最重要的部分 —— 图上会把孩子的错点单独标红，一定要认真填：
+- my：原样抄孩子写的答案（没作答就写"没作答"）。
+- at：定位到具体位置。layout 是 steps 时，必须同时给 step（整数，第几步，从 1 开始数）和 at（如"第2步：去括号"）。
+  其他版式给 at 就行，如"结论③""情形二""选项 B"。
+- why：说他这一步到底错在哪，是符号丢了、公式记错、还是概念没分清。要具体到这一步，不许写"粗心""没掌握"这种空话。
+- fix：告诉他这一步应该怎么想，或正确结果是什么。
+- 如果孩子的答案其实是对的（只是格式不同），why 写"答案正确，只是写法不同"，fix 写建议的规范写法。
+
+通用硬性要求：
+- known 必须是题干原意的直述，不要掺入推导结果。
+- 每个文字字段尽量短：known/keys 每条不超过 18 字，conclusion 不超过 30 字，verdicts.text 不超过 12 字，steps 每步不超过 22 字。
+- 全中文，用初中生能看懂的话，不要出现"显然""易得"这类词。
+- 只输出 JSON，不要任何解释。"""
+
+_SUBJ_RULE = {
+    '数学': """本题科目：数学。按下面顺序判断 layout：
 1. 题目里有 ① ② ③ 这类需要逐条判断真假的结论 —— verdicts 必须全部填上，ok 按真实对错填，不许全 true。
    如果这些结论里还需要分情况讨论（符号未定 / 位置未定 / 绝对值 / 动点），layout 用 "case_split"，
    并把 cases 也填上（这正是最有价值的部分）；否则 layout 用 "verdict_list"，cases 留空数组。
@@ -510,7 +636,7 @@ _SPEC_SYSTEM = """你是初中数学老师的板书设计师。给你一道题�
    每步写清"做了什么 + 算出什么"。cases 和 verdicts 留空数组。
 3. 需要按不同情况分别讨论，但不需要逐条判断结论 —— layout 用 "case_split"，verdicts 留空数组。
 
-硬性要求：
+数轴题的硬性要求：
 - 题目只要涉及数轴上的点（A、B、C 或 P、Q）的距离、线段长短比较，则**每一个情形都必须给出 points 和 segments**。
   不合格的反例：只给"满足条件"的情形画数轴，"不满足"的情形留空 —— 那样就看不出这个条件为什么必要。
   正确做法：两种情形都画出数轴，让学生自己看出长短关系反过来了。
@@ -518,37 +644,90 @@ _SPEC_SYSTEM = """你是初中数学老师的板书设计师。给你一道题�
 - segments 的 from/to 必须是 points 里出现过的 name。
 - 数轴只在该情形需要比较线段长短（AB、BC 这类）时才填；纯代数计算、跟数轴无关的情形，points 和 segments 都留空数组。
 - note 只写"这一情形取哪组数"，不要写结论判断；结论一律写进 conclusion。
-- known 必须是题干原意的直述，不要掺入推导结果。
-- 每个文字字段尽量短：known/keys 每条不超过 18 字，conclusion 不超过 30 字，verdicts.text 不超过 12 字。
-- 全中文，用初中生能看懂的话，不要出现"显然""易得"这类词。
-- 只输出 JSON，不要任何解释。"""
+- 数学题一律不要填数轴以外的图形；cases 最多 3 个，verdicts 最多 6 条，steps 最多 5 步。""",
+
+    '英语': """本题科目：英语（七年级）。按下面顺序判断 layout：
+1. 单选题 / 完形填空 / 词汇辨析 / 选词填空 —— layout 用 "verdict_list"，verdicts 逐条列出要判断的候选
+   （四个选项就列四条：A.xxx / B.xxx / C.xxx / D.xxx，no 填 "A""B""C""D"），
+   ok 只有正确答案那条为 true，其余为 false；每条 text 里写清楚为什么对/为什么错（如"缺谓语""时态不符"）。
+   known 填题干的关键信息（如"主语是第三人称单数""yesterday 表过去"），keys 填判定规则（如"一般现在时，动词加 -s"）。
+2. 句型转换 / 单句翻译 / 用所给词的适当形式填空 / 改写句子 —— layout 用 "steps"，steps 填 3~5 步：
+   判时态语态 → 定句子结构 → 选词或变形 → 检查形式（单复数/大小写/标点）。每步写"做什么 + 得到什么"。
+3. 阅读理解 / 任务型阅读 —— layout 用 "steps"，steps 按"读题干找关键词 → 回原文定位句子 → 比对选项 → 排除干扰"写，
+   known 填题干问的是什么，keys 填原文依据（英文原文原句，可带中文翻译）。
+4. 作文 / 表达类 —— layout 用 "steps"，steps 按"审题定人称时态 → 列要点 → 连词成句 → 检查语法"写。
+
+硬性要求：
+- 英语题**绝不填 points / segments**（那是数轴专用的），一律留空数组。
+- 英文单词、短语、句子照原文写，不要翻译成中文；中文解释写在括号里。
+- mistake.at 要定位到具体环节（如"时态判断""选项 B""第2步：定结构"），why 要说出具体语法点错在哪
+  （如"把一般现在时当成一般过去时，动词多加了 -ed"），不许只写"语法没掌握"。""",
+
+    '语文': """本题科目：语文（七年级，统编版）。按下面顺序判断 layout：
+1. 文言文实词 / 虚词 / 句子翻译 / 断句 —— layout 用 "steps"，steps 按"看清句式 → 定重点词意思 → 补出省略成分 → 调整语序成现代汉语"写，
+   known 填原句和出处，keys 填重点词解释（如"走：跑"）。
+2. 病句修改 / 词语（成语）运用 / 标点 / 修辞判断 —— layout 用 "verdict_list"，
+   verdicts 逐条列出可能的错误类型或选项（如"成分残缺""搭配不当""语序不当"或 A/B/C/D），ok 按真实对错填。
+3. 古诗词鉴赏 / 默写 —— layout 用 "steps"，steps 按"看题目和作者 → 抓意象 → 体会情感 → 组织答题语言"写。
+4. 现代文阅读（概括 / 含义理解 / 作用分析 / 人物形象）—— layout 用 "steps"，
+   steps 按"审题明考点 → 回原文定位段落 → 摘关键词 → 按答题格式组织语言"写，
+   known 填题目要求，keys 填这类题的答题格式（如"手法 + 内容 + 情感"）。
+5. 文学常识 / 名著 —— layout 用 "verdict_list"，逐条判定。
+
+硬性要求：
+- 语文题**绝不填 points / segments**（那是数轴专用的），一律留空数组。
+- steps 每步不超过 22 字，verdicts.text 不超过 12 字（比数学略宽，但别写成长句）。
+- mistake.at 定位到具体环节（如"第2步：释词""选项 C""没答情感这一层"），
+  why 要说出具体错在哪（如"把'走'按今义理解成走路，古义是跑"），不许只写"没读懂""基础不牢"。""",
+}
+
+_DEFAULT_RULE = """本题科目：其他。按下面顺序判断 layout：
+1. 需要逐条判断真假/对错（选项、结论、说法）—— layout 用 "verdict_list"，verdicts 逐条列出，ok 按真实对错填。
+2. 需要分情况讨论 —— layout 用 "case_split"，cases 最多 3 个。
+3. 其余按步骤推进 —— layout 用 "steps"，steps 填 3~5 步，每步写"做什么 + 得到什么"。
+不要填 points / segments（那是数学数轴专用的），一律留空数组。"""
 
 
-def build_spec(question: str, answer: str, explain: str, subject: str = '数学') -> dict:
+def _spec_system(subject: str) -> str:
+    rule = _SUBJ_RULE.get((subject or '').strip())
+    return _SPEC_COMMON + '\n\n' + (rule or _DEFAULT_RULE)
+
+
+def build_spec(question: str, answer: str, explain: str, subject: str = '数学',
+               user_answer: str = '') -> dict:
     """
     调用 AI 产出图解结构。返回 {'ok':bool, 'spec':dict, 'error':str}
     这是唯一需要联网的环节; 失败时调用方应回退到 build_fallback_spec()。
+    user_answer = 孩子实际写的答案, 用于让 AI 定位错点(图上的红色错因框); 没有就传空串。
     """
     import llm
     if not llm.is_llm_enabled():
         return {'ok': False, 'spec': {}, 'error': 'AI 老师未配置，无法生成图解'}
-    user = ('科目：%s\n题目：%s\n\n正确答案：%s\n\n解析：%s\n\n请输出图解 JSON。'
-            % (subject, question, answer, explain or '（无解析，请你自己推导一遍）'))
-    raw = llm._call_chat(_SPEC_SYSTEM, user, json_mode=True)
+    my = (user_answer or '').strip()
+    user = ('科目：%s\n题目：%s\n\n孩子写的答案：%s\n正确答案：%s\n\n解析：%s\n\n请输出图解 JSON（重点填好 mistake 错点定位）。'
+            % (subject, question, my or '（没作答）', answer,
+               explain or '（无解析，请你自己推导一遍）'))
+    raw = llm._call_chat(_spec_system(subject), user, json_mode=True)
     if not isinstance(raw, dict) or raw.get('error'):
         return {'ok': False, 'spec': {}, 'error': str((raw or {}).get('error') or 'AI 没有返回内容')}
     spec = sanitize_spec(raw, fallback_title='解题思路')
     if not spec or not (spec.get('cases') or spec.get('verdicts')
                         or spec.get('steps') or spec.get('answer')):
         return {'ok': False, 'spec': {}, 'error': 'AI 返回的内容不完整，没法画图'}
+    if my:
+        spec.setdefault('mistake', {})
+        if not spec['mistake'].get('my'):
+            spec['mistake'] = dict(spec['mistake'], my=my)
     spec = fill_compare_axis(spec, question)
     return {'ok': True, 'spec': spec, 'error': ''}
 
 
-def build_fallback_spec(question: str, answer: str, explain: str, topic: str = '') -> dict:
+def build_fallback_spec(question: str, answer: str, explain: str, topic: str = '',
+                        user_answer: str = '') -> dict:
     """
     AI 不可用时的本地降级: 不联网, 把解析按句拆成步骤图。
     宁可给一张朴素的步骤图, 也不让孩子看到一个空白区域。
+    降级图没有 AI 分析, 但仍要把孩子写的答案标出来(至少让他知道"我答的和正确答案不一样")。
     """
     steps = []
     for seg in re.split(r'(?<=[。；;！!])', (explain or '').strip()):
@@ -558,7 +737,7 @@ def build_fallback_spec(question: str, answer: str, explain: str, topic: str = '
     steps = steps[:5]
     if not steps:
         return {}
-    return sanitize_spec({
+    spec = sanitize_spec({
         'layout': 'steps',
         'title': (topic or '解题步骤'),
         'known': [fit(question, 200, 11.5)] if question else [],
@@ -566,3 +745,8 @@ def build_fallback_spec(question: str, answer: str, explain: str, topic: str = '
         'steps': steps,
         'answer': str(answer or ''),
     })
+    my = (user_answer or '').strip()
+    if my:
+        spec['mistake'] = {'my': my, 'at': 'AI 未接入，无法定位具体哪一步',
+                           'step': None, 'why': '对照下面的步骤，找出自己卡住的那一步', 'fix': ''}
+    return spec

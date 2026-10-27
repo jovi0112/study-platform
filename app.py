@@ -656,6 +656,8 @@ if page == '📝 每日测试':
                         _svg = quiz.render_mistake_diagram(_it)
                         if _svg:
                             st.markdown('**🧭 讲解图**')
+                            st.caption('看图顺序：先看主线，再看红色标记 —— 图最下面的红色卡片写着'
+                                       '「你答的是 / 错在哪一步 / 为什么错 / 应该这样想」。')
                             show_diagram(_svg)
                             if st.button('🎨 换一张图', key=f'qz_redraw_{_it["id"]}'):
                                 with st.spinner('重画中...'):
@@ -922,7 +924,18 @@ elif page == '📖 错题本':
                 with tabs[1]:
                     _svg = quiz.render_mistake_diagram(m)
                     if _svg:
-                        st.caption('一张图看清这题的解法主线: 已知条件 → 关键判断 → 分情况 → 逐条结论')
+                        st.caption('一张图看清解法主线: 已知条件 → 关键判断 → 分情况 → 逐条结论; '
+                                   '图最下面的红色卡片标出你错在哪一步、为什么错')
+                        # 老版本图没有错点标记, 提示重画(不静默留着旧图)
+                        if quiz.diagram_is_old(m):
+                            st.info('这张图是旧版，还没标出错点。点下面的按钮重画一张带红标的。')
+                            if st.button('🔴 重画一张带错点标记的图', key=f'md_upg_{m["id"]}'):
+                                with st.spinner('重画中(约 3~6 秒)…'):
+                                    _r = quiz.gen_diagram_for_mistake(m['id'], force=True)
+                                if _r['ok']:
+                                    st.rerun()
+                                else:
+                                    st.error(f"没画出来: {_r['error']}")
                         show_diagram(_svg)
                         if st.button('🎨 换一张图重新画', key=f'md_redraw_{m["id"]}'):
                             with st.spinner('重画中(约 3~6 秒)…'):

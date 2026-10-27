@@ -52,3 +52,7 @@ _t*.bat
 
 # 本地测试产生的临时图
 _*.png
+
+# 本地临时预览/应急脚本
+_preview_*.py
+_push_via_api.py

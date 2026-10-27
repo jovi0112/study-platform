@@ -1086,11 +1086,27 @@ def _cached_spec(row: dict):
     if not raw:
         return None
     try:
+        import diagram
         d = json.loads(raw)
-        spec = d.get('spec') if isinstance(d, dict) else None
+        if not isinstance(d, dict):
+            return None
+        # 老版本(没有错点定位)的图一律当没画过, 重新画一张带红标的
+        if int(d.get('v') or 0) < diagram.SPEC_VER:
+            return None
+        spec = d.get('spec')
         return (spec, bool(d.get('fallback'))) if spec else None
     except Exception:
         return None
+
+
+def diagram_is_old(row: dict) -> bool:
+    """这张图是不是老版本(还没有错点定位)? 用于提示用户重画。"""
+    try:
+        import diagram
+        d = json.loads((row or {}).get('diagram_json') or '{}')
+        return (not isinstance(d, dict)) or int(d.get('v') or 0) < diagram.SPEC_VER
+    except Exception:
+        return True
 
 
 def gen_diagram(item_id: int, force: bool = False) -> dict:
@@ -1112,20 +1128,23 @@ def gen_diagram(item_id: int, force: bool = False) -> dict:
                     'error': '', 'from_cache': True, 'fallback': fb}
 
     res = diagram.build_spec(row.get('stem') or '', row.get('answer') or '',
-                             row.get('explain') or '', row.get('subject') or '数学')
+                             row.get('explain') or '', row.get('subject') or '数学',
+                             row.get('user_answer') or '')
     fallback, err = False, ''
     if res['ok']:
         spec = res['spec']
     else:
         # AI 不可用/输出不合格 -> 本地按解析拆步骤, 不能让孩子看到空白
         spec = diagram.build_fallback_spec(row.get('stem') or '', row.get('answer') or '',
-                                          row.get('explain') or '', row.get('topic') or '')
+                                          row.get('explain') or '', row.get('topic') or '',
+                                          row.get('user_answer') or '')
         fallback, err = True, res.get('error', '')
         if not spec:
             return {'ok': False, 'svg': '', 'spec': {}, 'error': err or '没有可用的解析内容',
                     'from_cache': False}
 
-    payload = json.dumps({'spec': spec, 'fallback': fallback, 'error': err}, ensure_ascii=False)
+    payload = json.dumps({'spec': spec, 'fallback': fallback, 'error': err,
+                          'v': diagram.SPEC_VER}, ensure_ascii=False)
     with _conn() as conn:
         conn.execute('UPDATE quiz_items SET diagram_json=? WHERE id=?', (payload, item_id))
     return {'ok': True, 'svg': diagram.render_svg(spec), 'spec': spec,
@@ -1136,11 +1155,13 @@ def _gen_one_offline(item: dict) -> dict:
     """只调 AI 拿结构, 不碰数据库(并发安全)。失败则本地降级。"""
     import diagram
     res = diagram.build_spec(item.get('stem') or '', item.get('answer') or '',
-                             item.get('explain') or '', item.get('subject') or '数学')
+                             item.get('explain') or '', item.get('subject') or '数学',
+                             item.get('user_answer') or '')
     if res['ok']:
         return {'id': item['id'], 'spec': res['spec'], 'fallback': False, 'error': ''}
     spec = diagram.build_fallback_spec(item.get('stem') or '', item.get('answer') or '',
-                                       item.get('explain') or '', item.get('topic') or '')
+                                       item.get('explain') or '', item.get('topic') or '',
+                                       item.get('user_answer') or '')
     return {'id': item['id'], 'spec': spec, 'fallback': True,
             'error': res.get('error', 'AI 未返回可用结构')}
 
@@ -1152,6 +1173,7 @@ def gen_diagrams_for_paper(pid: int, max_n: int = MAX_DIAGRAMS_PER_PAPER,
     并发只发生在 AI 调用上, 写库统一回到当前线程 —— SQLite 一条连接不能跨线程写。
     返回 {'ok','failed','skipped','errors':[...]}
     """
+    import diagram
     data = get_paper(pid)
     wrong = [it for it in data.get('items', []) if it.get('correct') != 1]
     todo, skipped = [], 0
@@ -1191,7 +1213,8 @@ def gen_diagrams_for_paper(pid: int, max_n: int = MAX_DIAGRAMS_PER_PAPER,
             if not r.get('spec'):
                 continue
             payload = json.dumps({'spec': r['spec'], 'fallback': r['fallback'],
-                                  'error': r.get('error', '')}, ensure_ascii=False)
+                                  'error': r.get('error', ''), 'v': diagram.SPEC_VER},
+                                 ensure_ascii=False)
             conn.execute('UPDATE quiz_items SET diagram_json=? WHERE id=?', (payload, r['id']))
 
     ok = len([r for r in results if r.get('spec')])
@@ -1247,23 +1270,27 @@ def gen_diagram_for_mistake(mistake_id: int, force: bool = False) -> dict:
     if not row:
         return {'ok': False, 'svg': '', 'spec': {}, 'error': '错题不存在'}
     m = dict(row)
-    if not force and m.get('diagram_json'):
+    # 老版本图(没有错点定位)不算缓存, 直接重画
+    if not force and m.get('diagram_json') and not diagram_is_old(m):
         svg = render_mistake_diagram(m)
         if svg:
             return {'ok': True, 'svg': svg, 'spec': {}, 'error': '', 'from_cache': True}
 
     res = diagram.build_spec(m.get('question') or '', m.get('correct_answer') or '',
-                             m.get('explanation') or '', m.get('subject') or '数学')
+                             m.get('explanation') or '', m.get('subject') or '数学',
+                             m.get('answer') or '')
     fallback, err = False, ''
     if res['ok']:
         spec = res['spec']
     else:
         spec = diagram.build_fallback_spec(m.get('question') or '', m.get('correct_answer') or '',
-                                           m.get('explanation') or '', m.get('title') or '')
+                                           m.get('explanation') or '', m.get('title') or '',
+                                           m.get('answer') or '')
         fallback, err = True, res.get('error', '')
         if not spec:
             return {'ok': False, 'svg': '', 'spec': {}, 'error': err or '这道题没有解析，画不了图'}
-    payload = json.dumps({'spec': spec, 'fallback': fallback, 'error': err}, ensure_ascii=False)
+    payload = json.dumps({'spec': spec, 'fallback': fallback, 'error': err,
+                          'v': diagram.SPEC_VER}, ensure_ascii=False)
     with db.get_conn() as conn:
         conn.execute('UPDATE mistakes SET diagram_json=? WHERE id=?', (payload, mistake_id))
     return {'ok': True, 'svg': diagram.render_svg(spec), 'spec': spec,
