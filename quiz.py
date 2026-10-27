@@ -234,6 +234,22 @@ def bank_stats(subject: str) -> dict:
     return {'seed': len(seed), 'ai': len(ai), 'total': len(seed) + len(ai), 'topics': topics}
 
 
+def scope_stats(subject: str, on: date = None) -> dict:
+    """当前进度段能出多少题、题型怎么分布。页面用它解释「为什么只能出这么多」，
+    而不是让用户对着一个填不上去的数字猜。"""
+    ph = current_phase(subject, on)
+    bank = all_bank(subject)
+    if not ph:
+        return {'in_scope': 0, 'bank': len(bank), 'types': {}, 'phase': None}
+    topics = ph.get('topics', [])
+    in_scope = [q for q in bank if q['topic'] in topics or q['chapter'] in topics]
+    types = {}
+    for q in in_scope:
+        k = q.get('qtype') or 'fill'
+        types[k] = types.get(k, 0) + 1
+    return {'in_scope': len(in_scope), 'bank': len(bank), 'types': types, 'phase': ph}
+
+
 # ============== 掌握度 ==============
 def get_mastery(subject: str) -> dict:
     with _conn() as conn:
@@ -284,10 +300,10 @@ _GEN_SYSTEM = """你是一名北京市初中一线教师, 正在给初一学生�
 
 输出格式:
 {"questions":[{
-  "type":"choice" | "fill" | "answer",
+  "type":"choice" | "fill" | "calc" | "answer" | "judge",
   "stem":"题面",
   "options":{"A":"...","B":"...","C":"...","D":"..."},   // 仅 choice 需要
-  "answer":"正确答案(choice 填 A/B/C/D; fill 填简洁结果)",
+  "answer":"choice 填 A/B/C/D; fill/calc 填简洁结果; judge 填 对 或 错; answer 填解题要点与最终结论",
   "alt":["可接受的其它写法"],
   "explain":"给孩子的讲解",
   "difficulty":1-5,
@@ -312,9 +328,10 @@ def _eval_expr(expr: str):
 
 
 def ai_generate_questions(subject: str, topic: str, chapter: str, n: int = 5,
-                          difficulty: int = 3) -> dict:
+                          difficulty: int = 3, want_types: list = None) -> dict:
     """
     AI 出变式题, 含自动验算。
+    want_types: 指定题型偏好, 如 ['judge','answer'], 避免每次都只出选择题
     返回 {'ok':bool, 'questions':[...], 'msg':str, 'rejected':int}
     """
     import llm
@@ -322,9 +339,17 @@ def ai_generate_questions(subject: str, topic: str, chapter: str, n: int = 5,
         return {'ok': False, 'questions': [], 'msg': 'AI 老师未配置, 无法生成变式题(可在家长端配置 Key)', 'rejected': 0}
 
     ver = {'数学': '人教版七年级上册', '英语': '北师大版七年级上册', '语文': '统编版七年级上册'}.get(subject, '')
+    if want_types:
+        type_req = f"题型要求: 这 {n} 道题里必须覆盖这些题型 {', '.join(want_types)}(类型名照抄), 不要全出同一种。"
+    elif subject == '数学':
+        type_req = ("题型要求: 混合出题, 至少覆盖三种 —— choice(选择)、fill(填空)、"
+                    "以及 judge(判断,答案是 对/错) 或 answer(要写过程的解答题, 应用题/几何推理题)。"
+                    "严禁全是选择题。")
+    else:
+        type_req = "题型要求: 混合出 choice(选择)、fill(填空)、answer(简答) 三种, 不要全出同一种。"
     user = (f"科目: {subject}（教材 {ver}）\n章节: {chapter}\n知识点: {topic}\n"
             f"难度: {difficulty}/5\n数量: {n}\n"
-            f"要求: 出 {n} 道考查「{topic}」的新题, 题型尽量多样(选择/填空), "
+            f"要求: 出 {n} 道考查「{topic}」的新题。{type_req}\n"
             f"不要和下面的样题重复:\n（无样题）")
 
     res = llm._call_chat(_GEN_SYSTEM, user, json_mode=True)
@@ -346,6 +371,17 @@ def ai_generate_questions(subject: str, topic: str, chapter: str, n: int = 5,
             if str(q['answer']).strip().upper()[:1] not in (q['options'].keys()):
                 rejected += 1
                 continue
+        if qtype == 'judge':
+            if str(q.get('answer', '')).strip() not in ('对', '错', '正确', '错误', '√', '×', 'T', 'F', 'true', 'false'):
+                # AI 把判断题写成了别的形式, 统一成 对/错 再收, 认不出就丢
+                _j = normalize(q.get('answer')).lower()
+                if _j in ('对', '正确', '√', 't', 'true'):
+                    q['answer'] = '对'
+                elif _j in ('错', '错误', 'x', '*', 'f', 'false'):
+                    q['answer'] = '错'
+                else:
+                    rejected += 1
+                    continue
         # 自动验算
         verified = False
         v = q.get('verify') or {}
@@ -432,10 +468,36 @@ def _as_number(s):
 
 
 def is_correct(q: dict, user_answer) -> bool:
+    qt = (q.get('qtype') or q.get('type') or '').lower()
+    ans_raw = q.get('answer')
+
+    # ---- 多选题: 选择集合完全一致才算对(少选/多选都算错) ----
+    if qt == 'multi':
+        if isinstance(user_answer, (list, tuple, set)):
+            ua_set = {str(x).strip().upper()[:1] for x in user_answer if str(x).strip()}
+        else:
+            ua_set = {c.upper() for c in re.findall(r'[A-Da-d]', str(user_answer or ''))}
+        ans_set = {c.upper() for c in re.findall(r'[A-Da-d]', str(ans_raw or ''))}
+        return bool(ua_set) and ua_set == ans_set
+
+    # ---- 判断题: 对/错的各种写法都认 ----
+    if qt == 'judge':
+        ua = normalize(user_answer).lower()
+        if isinstance(user_answer, bool):
+            ua = '对' if user_answer else '错'
+        yes = {'对', '正确', '√', 't', 'true', 'yes', 'y', '是', '对的'}
+        no = {'错', '错误', 'x', '×', '*', 'f', 'false', 'no', 'n', '否', '错的'}
+        ans_yes = normalize(ans_raw).lower() in yes or str(ans_raw).strip() in ('对', '√', '正确', 'T', 'True')
+        if ua in yes:
+            return ans_yes
+        if ua in no:
+            return not ans_yes
+        return False
+
     ua = normalize(user_answer)
     if not ua:
         return False
-    ans = normalize(q.get('answer'))
+    ans = normalize(ans_raw)
     if ua == ans:
         return True
     # 大小写容错: 英语单词(Library/library)、选项字母(b/B)
@@ -484,10 +546,75 @@ def ai_grade(subject: str, stem: str, ref_answer: str, user_answer: str, full_sc
 
 
 # ============== 组卷 ==============
+TYPE_NAMES = {'choice': '选择', 'fill': '填空', 'calc': '计算',
+              'answer': '解答', 'judge': '判断', 'multi': '多选'}
+
+
+def _recent_uids(subject: str, days: int = 10, limit: int = 300) -> set:
+    """最近做过的题 uid。用来优先出没见过的题, 避免每次刷新都是同一批。"""
+    try:
+        since = (datetime.now() - timedelta(days=days)).isoformat(timespec='seconds')
+        with _conn() as conn:
+            rows = conn.execute(
+                'SELECT qi.uid AS uid FROM quiz_items qi JOIN quiz_papers qp ON qi.paper_id = qp.id '
+                'WHERE qp.subject = ? AND qp.created_at >= ? ORDER BY qp.id DESC LIMIT ?',
+                (subject, since, limit)).fetchall()
+        return {r['uid'] for r in rows if r['uid']}
+    except Exception:
+        return set()
+
+
+def _pick_by_mix(subject: str, pool: list, n: int, seen: set) -> list:
+    """
+    题型轮转 + 难度阶梯 挑题。
+
+    以前只按「难度贴近掌握度」排序, 结果一张卷子全是同类型的计算题;
+    孩子看到的就是"怎么又是去括号"。现在改成:
+    - 每轮每种题型各取 1 道 → 一张卷子里题型不会重样
+    - 轮次之间难度上下拉开(0,+1,-1,+2,-2) → 自然形成由易到难
+    - 最近做过的题降权 → 每次刷新都尽量给没见过的
+    """
+    by_type = {}
+    for q in pool:
+        by_type.setdefault(q.get('qtype') or 'fill', []).append(q)
+    if not by_type:
+        return []
+    # 题多的题型先轮, 小众题型(判断/多选)也会轮到但排在后面
+    order = sorted(by_type.keys(), key=lambda t: (-len(by_type[t]), t))
+    picked, used = [], set()
+    delta_seq = [0, 1, -1, 2, -2, 0, 1]
+    rnd = 0
+    while len(picked) < n and rnd < n * 3 + 3:
+        delta = delta_seq[rnd % len(delta_seq)]
+        progressed = False
+        for t in order:
+            if len(picked) >= n:
+                break
+            cand = [q for q in by_type[t] if q['uid'] not in used]
+            if not cand:
+                continue
+
+            def _key(q, _delta=delta):
+                lvl = topic_level(subject, q.get('topic') or '')
+                want = max(1, min(5, lvl + _delta))
+                return (1 if q['uid'] in seen else 0,
+                        abs(int(q.get('difficulty') or 3) - want),
+                        random.random())
+
+            q = min(cand, key=_key)
+            picked.append(q)
+            used.add(q['uid'])
+            progressed = True
+        if not progressed:
+            break
+        rnd += 1
+    return picked
+
+
 def pick_questions(subject: str, n: int = 10, on: date = None, use_ai: bool = True) -> dict:
     """
     按当前进度 + 掌握度组卷。
-    返回 {'ok':bool, 'questions':[...], 'phase':..., 'msg':..., 'ai_added':int}
+    返回 {'ok':bool, 'questions':[...], 'phase':..., 'msg':..., 'ai_added':int, 'review_added':int}
     """
     ph = current_phase(subject, on)
     if not ph:
@@ -497,45 +624,75 @@ def pick_questions(subject: str, n: int = 10, on: date = None, use_ai: bool = Tr
 
     # 1) 当前进度范围内的题
     in_scope = [q for q in bank if q['topic'] in topics or q['chapter'] in topics]
-    # 2) 难度贴近掌握度
-    def target_of(q):
-        return topic_level(subject, q['topic'])
-    scored = []
-    for q in in_scope:
-        tgt = target_of(q)
-        scored.append((abs(q['difficulty'] - tgt), random.random(), q))
-    scored.sort(key=lambda x: (x[0], x[1]))
-    picked = [s[2] for s in scored[:n]]
+    seen = _recent_uids(subject)
 
-    # 3) 复习: 上次做错的知识点优先插一道
-    # 上次做错的知识点优先插一道(哪怕已不在当前进度里, 复习是应该的)
-    for t in recent_wrong_topics(subject, limit=3):
-        cand = [q for q in bank if q['topic'] == t and q['uid'] not in {p['uid'] for p in picked}]
-        if cand:
-            picked.insert(0, random.choice(cand))
-            break
-    picked = picked[:n]
+    # 2) 题型轮转 + 难度阶梯。优先只用"没做过"的题, 做完才回头重复
+    fresh = [q for q in in_scope if q['uid'] not in seen]
+    pool = fresh if len(fresh) >= n else in_scope
+    picked = _pick_by_mix(subject, pool, n, seen)
+    used = {q['uid'] for q in picked}
 
-    ai_added = 0
-    msg = f"从题库选出 {len(picked)} 道"
-    # 4) 不够就用 AI 补, 补的题要过验算
+    # 3) 当前进度段的题不够 → 从已学过的其它章节补「复习题」(不超纲, 都是学过的)
+    review_added = 0
     if len(picked) < n:
+        rest = [q for q in bank if q['uid'] not in used]
+        # 没做过的排前面, 难度别太高的排前面
+        rest.sort(key=lambda q: (1 if q['uid'] in seen else 0,
+                                 abs(int(q.get('difficulty') or 3) - 3),
+                                 random.random()))
+        for q in rest:
+            if len(picked) >= n:
+                break
+            q = dict(q, review=True)
+            picked.append(q)
+            used.add(q['uid'])
+            review_added += 1
+
+    # 3b) 当前进度段已经练完(选出来的一大半都是做过的) → 用跨章节没做过的题换掉一部分,
+    #     否则孩子第二次刷新会看到一模一样的卷子。上限 40%, 保证仍以当前进度为主。
+    if seen and picked:
+        stale = [q for q in picked if q['uid'] in seen]
+        fresh_cnt = len(picked) - len(stale)
+        if stale and fresh_cnt < n:
+            cap = int(n * 0.4)
+            rest_new = [q for q in bank if q['uid'] not in used and q['uid'] not in seen]
+            random.shuffle(rest_new)
+            for old in stale[:min(len(stale), max(0, min(n - fresh_cnt, cap)))]:
+                if not rest_new:
+                    break
+                newq = dict(rest_new.pop(), review=True)
+                picked[picked.index(old)] = newq
+                used.add(newq['uid'])
+                review_added += 1
+
+    # 4) 还不够(题库总量不足) → AI 补, 要求题型多样, 且过验算
+    ai_added = 0
+    have_types = {q.get('qtype') for q in picked}
+    # 缺什么题型就让 AI 补什么题型
+    want = [t for t in ('judge', 'answer', 'calc', 'choice') if t not in have_types]
+    parts = [f"题库出 {len(picked) - review_added} 道"]
+    if review_added:
+        parts.append(f"跨章节复习 {review_added} 道")
+
+    if len(picked) < n:
+        need = n - len(picked)
         if not use_ai:
-            msg += f"（题库只有 {len(picked)} 道, 未开启 AI 补充）"
+            parts.append(f"还差 {need} 道（题库总量不够, 未开启 AI 补充）")
         else:
-            need = n - len(picked)
             import llm
             if not llm.is_llm_enabled():
-                msg += f"（题库不足, 还差 {need} 道, 但 AI 未配置）"
+                parts.append(f"还差 {need} 道（题库总量不够, 且 AI 未配置）")
             else:
                 gen = {'msg': '当前进度没有可用知识点'}
                 cand_topics = topics or [ph.get('label', '') or subject]
-                # 多试几个知识点、每次多要几道, 提高凑齐概率(A出题常被验算淘汰)
-                for t in random.sample(cand_topics, min(len(cand_topics), 5)):
-                    if ai_added >= need:
+                tries = 0
+                for t in random.sample(cand_topics, min(len(cand_topics), 6)):
+                    if ai_added >= need or tries >= 8:
                         break
-                    gen = ai_generate_questions(subject, t, ph.get('label', ''), n=3,
-                                                difficulty=topic_level(subject, t))
+                    tries += 1
+                    gen = ai_generate_questions(subject, t, ph.get('label', ''), n=min(4, need - ai_added),
+                                                difficulty=topic_level(subject, t),
+                                                want_types=want[:2] if want else None)
                     for q in gen.get('questions', []):
                         if ai_added >= need:
                             break
@@ -543,15 +700,29 @@ def pick_questions(subject: str, n: int = 10, on: date = None, use_ai: bool = Tr
                             save_ai_question(q)
                             picked.append(q)
                             ai_added += 1
+                            if q.get('qtype') in want:
+                                want.remove(q['qtype'])
                 if ai_added:
-                    msg += f"，AI 补充 {ai_added} 道（已过验算）"
+                    parts.append(f"AI 现出 {ai_added} 道（已过验算）")
                 else:
-                    msg += f"，AI 补充失败: {gen.get('msg', '未知原因')}"
+                    parts.append(f"还差 {need} 道, AI 补充没成（{gen.get('msg', '未知原因')}）")
+
+    # 5) 上次做错的知识点, 塞一道进来复习
+    for t in recent_wrong_topics(subject, limit=3):
+        cand = [q for q in bank if q['topic'] == t and q['uid'] not in used]
+        if cand:
+            q = dict(random.choice(cand), review=True)
+            picked.insert(0, q)
+            used.add(q['uid'])
+            break
 
     if not picked:
-        return {'ok': False, 'questions': [], 'msg': f'没选出题来。{msg}', 'phase': ph, 'ai_added': 0}
+        return {'ok': False, 'questions': [], 'msg': '没选出题来：题库和 AI 都没能给出题目', 'phase': ph, 'ai_added': 0}
     random.shuffle(picked)
-    return {'ok': True, 'questions': picked, 'phase': ph, 'msg': msg, 'ai_added': ai_added}
+    types_in = [TYPE_NAMES.get(t, t) for t in sorted({q.get('qtype') for q in picked})]
+    msg = '，'.join(parts) + f"；本卷题型：{'/'.join(types_in)}"
+    return {'ok': True, 'questions': picked, 'phase': ph, 'msg': msg,
+            'ai_added': ai_added, 'review_added': review_added}
 
 
 def save_ai_question(q: dict):
@@ -633,6 +804,7 @@ def grade_paper(pid: int, subject: str) -> dict:
                 pending_ai.append(it['id'])
         else:
             ok = is_correct({'answer': it['answer'], 'alt': json.loads(it['alt_json'] or '[]'),
+                             'qtype': it['qtype'],
                              'options': json.loads(it['options_json']) if it['options_json'] else None},
                             it['user_answer'])
             results.append((it['id'], 1 if ok else 0, None, None, 'exact', it['topic']))

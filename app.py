@@ -355,19 +355,27 @@ llm_info = llm.config_info()
 llm_status = "✅ 已启用" if llm_info['enabled'] else "⚠️ 离线"
 st.sidebar.markdown(f"**AI 老师**: {llm_status} ({llm_info['provider_display']})", unsafe_allow_html=True)
 _vs = llm.vision_status()
-st.sidebar.markdown(f"**AI 看图**: {'✅ 已启用' if _vs['enabled'] else '⚪ 未开启'}", unsafe_allow_html=True)
+if _vs['enabled']:
+    st.sidebar.markdown(f"**AI 看图**: ✅ 已启用（{_vs.get('model', '')}）", unsafe_allow_html=True)
+else:
+    st.sidebar.markdown('**AI 看图**: ⚪ 未开启', unsafe_allow_html=True)
+    st.sidebar.caption(f"不开也能用：本地识图已就绪，只是手写体、拍歪的题识别率低些。"
+                       f"开启需配视觉模型 Key（DeepSeek 不支持看图）。原因：{_vs.get('reason', '未配置')}")
 
 # 云端备份: 明说状态, 失败就报失败, 不假装已备份
 _bs = backup.status()
 if not _bs['enabled']:
-    _bk = '⚪ 未开启'
+    st.sidebar.markdown('**云端备份**: ⚪ 未开启', unsafe_allow_html=True)
+    st.sidebar.caption("数据现在只存在这台机器上，换电脑或重装系统会全部丢失。"
+                       "开启需配 GitHub token（STUDY_BACKUP_TOKEN）。")
 elif _bs['last_push_ok'] is False:
-    _bk = '⚠️ 备份失败'
+    st.sidebar.markdown('**云端备份**: ⚠️ 备份失败', unsafe_allow_html=True)
+    if _bs.get('last_push_error'):
+        st.sidebar.caption(f"最近一次失败原因：{str(_bs['last_push_error'])[:80]}")
 elif _bs['last_push_at']:
-    _bk = f"✅ 已备份 {_bs['last_push_at']}"
+    st.sidebar.markdown(f"**云端备份**: ✅ 已备份 {_bs['last_push_at']}", unsafe_allow_html=True)
 else:
-    _bk = '✅ 待备份'
-st.sidebar.markdown(f"**云端备份**: {_bk}", unsafe_allow_html=True)
+    st.sidebar.markdown('**云端备份**: ✅ 待备份', unsafe_allow_html=True)
 
 # 启动时自动找回的提示(孩子看得懂的版本)
 if _backup_start.get('restored'):
@@ -402,11 +410,24 @@ if page == '📝 每日测试':
     st.divider()
 
     # ---- 选科出题 ----
-    _c1, _c2 = st.columns([2, 2])
+    _c1, _c2, _c3 = st.columns([2, 2, 2])
     with _c1:
         qz_subject = st.selectbox('科目', quiz.SUBJECTS, key='qz_subject_sel', on_change=_qz_reset)
     with _c2:
-        qz_n = st.slider('题数', 5, 20, 10, key='qz_n')
+        _size = st.selectbox('卷子大小', ['小测 · 10 题', '标准 · 15 题', '大卷 · 20 题', '冲刺 · 30 题'],
+                             index=1, key='qz_size')
+        qz_n = {'小测 · 10 题': 10, '标准 · 15 题': 15, '大卷 · 20 题': 20, '冲刺 · 30 题': 30}[_size]
+    with _c3:
+        _sc = quiz.scope_stats(qz_subject)
+        st.metric('当前进度段可出题', f"{_sc['in_scope']} 道", f"题库共 {_sc['bank']} 道",
+                  delta_color='off')
+    _sc_types = _sc.get('types') or {}
+    if _sc_types:
+        st.caption('当前进度段题型：' + ' · '.join(
+            f"{quiz.TYPE_NAMES.get(k, k)} {v}" for k, v in sorted(_sc_types.items(), key=lambda x: -x[1])))
+    if qz_n > _sc['in_scope']:
+        st.caption(f"⚠️ 选了 {qz_n} 题，但当前进度段只有 {_sc['in_scope']} 道 —— 差的部分会先用"
+                   f"「已学过的其它章节」补复习题，再用 AI 现出；题量越大等待越久。")
     qz_use_ai = st.checkbox('题库不够时用 AI 出题补充（会自动验算, 稍慢）', value=True, key='qz_use_ai')
 
     if st.button('🎲 刷新一套新题', type='primary'):
@@ -429,18 +450,36 @@ if page == '📝 每日测试':
     # ---- 答题 ----
     if _qs and _pid and not st.session_state.get('qz_report'):
         st.divider()
+        _type_cnt = {}
+        for _q in _qs:
+            _type_cnt[_q.get('qtype', 'fill')] = _type_cnt.get(_q.get('qtype', 'fill'), 0) + 1
+        _type_txt = ' · '.join(f"{quiz.TYPE_NAMES.get(k, k)}{v}题" for k, v in _type_cnt.items())
         st.subheader(f'✏️ 答题（{_qs_subject} · 共 {len(_qs)} 题）')
+        st.caption(f"题型分布：{_type_txt}")
         with st.form('qz_form'):
             for _i, _q in enumerate(_qs):
-                _tag = 'AI 出题·已验算' if _q['source'] == 'ai' else '题库'
+                if _q.get('source') == 'ai':
+                    _tag = 'AI 出题·已验算'
+                elif _q.get('review'):
+                    _tag = '题库·跨章节复习'
+                else:
+                    _tag = '题库'
+                _qtype_name = quiz.TYPE_NAMES.get(_q.get('qtype'), '')
                 st.markdown(
-                    f"**第 {_i + 1} 题**　`{_q.get('topic', '')}`　难度 {'★' * int(_q.get('difficulty', 3))}　"
+                    f"**第 {_i + 1} 题**　`{_q.get('topic', '')}`　`{_qtype_name}`　难度 {'★' * int(_q.get('difficulty', 3))}　"
                     f"<span style='color:#888888'>{_tag}</span>", unsafe_allow_html=True)
                 st.write(_q['stem'])
-                if _q['qtype'] == 'choice' and _q.get('options'):
+                if _q.get('qtype') == 'choice' and _q.get('options'):
                     _opts = ['（先选一个）'] + [f"{k}. {v}" for k, v in _q['options'].items()]
                     st.radio('选项', _opts, key=f'qz_q_{_i}', label_visibility='collapsed')
-                elif _q['qtype'] == 'answer':
+                elif _q.get('qtype') == 'multi' and _q.get('options'):
+                    _opts = [f"{k}. {v}" for k, v in _q['options'].items()]
+                    st.multiselect('多选（少选或多选都算错）', _opts, key=f'qz_q_{_i}',
+                                   label_visibility='collapsed', placeholder='可选多个选项')
+                elif _q.get('qtype') == 'judge':
+                    st.radio('判断', ['对', '错'], key=f'qz_q_{_i}', horizontal=True,
+                             label_visibility='collapsed', index=None)
+                elif _q.get('qtype') == 'answer':
                     st.text_area('作答', key=f'qz_q_{_i}', height=110, label_visibility='collapsed')
                 else:
                     st.text_input('答案', key=f'qz_q_{_i}', label_visibility='collapsed')
@@ -452,6 +491,9 @@ if page == '📝 每日测试':
                 _v = st.session_state.get(f'qz_q_{_i}', '')
                 if _v == '（先选一个）':
                     _v = ''
+                if isinstance(_v, list):
+                    # 多选题存成 ABC 形式, 空格分隔的选项文字去掉
+                    _v = ''.join(sorted(x.strip()[:1] for x in _v if x.strip()))
                 quiz.save_answer(_it['id'], _v)
             with st.spinner('判卷中, 主观题要请 AI 老师批...'):
                 _rep = quiz.grade_paper(_pid, _qs_subject)
