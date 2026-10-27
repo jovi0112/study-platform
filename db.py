@@ -111,6 +111,8 @@ def init_db():
         _ensure_column(conn, 'mistakes', 'passage', 'TEXT')       # 阅读题原文(没课本也做得了)
         _ensure_column(conn, 'mistakes', 'miss_reason', 'TEXT')   # 未做原因: timeout / blank / ''
         _ensure_column(conn, 'mistakes', 'uid', 'TEXT')
+        # 后补的列只能在 ALTER 之后建索引 —— 写进 SCHEMA 会在老库上直接把 init_db 打崩
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mistakes_miss ON mistakes(miss_reason)")
         conn.executescript("""
 CREATE TABLE IF NOT EXISTS mistake_redo (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,16 +159,40 @@ def add_mistake(subject, question, **kwargs):
         return cur.lastrowid
 
 
-def list_mistakes(subject=None, mastered=None, limit=200, offset=0):
-    sql = "SELECT * FROM mistakes WHERE 1=1"
-    params = []
+def _mistake_where(subject=None, mastered=None, miss_reason=None):
+    """
+    拼 WHERE 条件 + 参数. 过滤必须在 SQL 层做完 ——
+    以前是"先取最近 N 条、再在内存里筛", 结果 N 条之外的题根本进不了筛选,
+    明明有「没做完」的题却显示为空。
+    """
+    sql, params = "1=1", []
     if subject and subject != '全部':
         sql += " AND subject = ?"
         params.append(subject)
     if mastered is not None:
         sql += " AND mastered = ?"
         params.append(int(mastered))
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    if miss_reason:
+        if isinstance(miss_reason, (list, tuple)):
+            sql += " AND miss_reason IN (%s)" % ','.join('?' * len(miss_reason))
+            params += list(miss_reason)
+        else:
+            sql += " AND miss_reason = ?"
+            params.append(miss_reason)
+    return sql, params
+
+
+def count_mistakes(subject=None, mastered=None, miss_reason=None) -> int:
+    """同条件下的总条数 —— 分页要显示"共多少条"必须靠它, 不能用 len(当页)"""
+    where, params = _mistake_where(subject, mastered, miss_reason)
+    with get_conn() as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) AS c FROM mistakes WHERE {where}", params).fetchone()['c']
+
+
+def list_mistakes(subject=None, mastered=None, limit=200, offset=0, miss_reason=None):
+    where, params = _mistake_where(subject, mastered, miss_reason)
+    sql = f"SELECT * FROM mistakes WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?"
     params += [limit, offset]
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -175,6 +201,19 @@ def list_mistakes(subject=None, mastered=None, limit=200, offset=0):
 def get_mistake(mid):
     with get_conn() as conn:
         r = conn.execute("SELECT * FROM mistakes WHERE id=?", (mid,)).fetchone()
+        return dict(r) if r else None
+
+
+def mistake_by_uid(uid):
+    """
+    按 uid 找已经进过错题本的同一道题。
+    判卷后会自动推错题; 别处再推一次(或网络重试)就会多出一模一样的一条,
+    错题本越积越臃肿 —— 推之前先拿 uid 查一下。
+    """
+    if not uid:
+        return None
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM mistakes WHERE uid=? LIMIT 1", (uid,)).fetchone()
         return dict(r) if r else None
 
 

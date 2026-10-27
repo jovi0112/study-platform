@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import json
+import math
 import base64
 import streamlit as st
 from datetime import datetime
@@ -1112,23 +1113,63 @@ elif page == '📖 错题本':
     with c2:
         master_filter = st.selectbox('状态', ['全部', '未掌握', '已掌握', '⏰ 没做完的'], key='master_filter')
     with c3:
-        limit = st.number_input('显示条数', 10, 500, 50, key='limit')
+        # 每页条数直接决定页面快慢: 每张卡片要建 8 个页签, 一次渲染几百张会明显卡
+        per_page = st.selectbox('每页显示', [10, 20, 30, 50], index=1, key='mk_per_page')
 
     _only_unfinished = (master_filter == '⏰ 没做完的')
+    _mastered = (None if master_filter in ('全部', '⏰ 没做完的')
+                 else (0 if master_filter == '未掌握' else 1))
+    # 「没做完」在 SQL 层筛, 不能先截断再筛 —— 否则老一点的未做完题永远翻不到
+    _miss_reason = ('timeout', 'blank') if _only_unfinished else None
+
+    _total = db.count_mistakes(subject=sub_filter, mastered=_mastered, miss_reason=_miss_reason)
+    _pages = max(1, math.ceil(_total / per_page)) if _total else 1
+
+    # 换筛选条件/每页条数时回到第 1 页, 否则会停在一个不存在的页码上
+    _sig = f'{sub_filter}|{master_filter}|{per_page}'
+    if st.session_state.get('mk_page_sig') != _sig:
+        st.session_state['mk_page_sig'] = _sig
+        st.session_state['mk_page'] = 1
+    _page = min(max(1, int(st.session_state.get('mk_page') or 1)), _pages)
+    _offset = (_page - 1) * per_page
+
     items = db.list_mistakes(
         subject=sub_filter,
-        mastered=None if master_filter in ('全部', '⏰ 没做完的')
-        else (0 if master_filter == '未掌握' else 1),
-        limit=limit,
+        mastered=_mastered,
+        miss_reason=_miss_reason,
+        limit=per_page,
+        offset=_offset,
     )
-    if _only_unfinished:
-        items = [m for m in items if (m.get('miss_reason') or '') in ('timeout', 'blank')]
+
+    def _mk_pager(_where: str):
+        """上下各放一组翻页, 滚到底不用回到顶部"""
+        a, b, c, d = st.columns([1, 1, 1.2, 3])
+        with a:
+            if st.button('⬅️ 上一页', key=f'mk_prev_{_where}',
+                         disabled=(_page <= 1), use_container_width=True):
+                st.session_state['mk_page'] = _page - 1
+                st.rerun()
+        with b:
+            if st.button('下一页 ➡️', key=f'mk_next_{_where}',
+                         disabled=(_page >= _pages), use_container_width=True):
+                st.session_state['mk_page'] = _page + 1
+                st.rerun()
+        with c:
+            _jump = st.number_input('跳页', 1, _pages, _page, key=f'mk_jump_{_where}')
+            if _jump != _page:
+                st.session_state['mk_page'] = _jump
+                st.rerun()
+        with d:
+            st.caption(f'共 **{_total}** 条 · 当前第 {_offset + 1}–'
+                       f'{min(_offset + per_page, _total)} 条 · 第 {_page}/{_pages} 页')
+
+    _mk_pager('top')
 
     if not items:
         st.info('还没有错题, 去"拍照录入"添加第一道吧.' if not _only_unfinished
                 else '没有「没做完」的错题。')
     else:
-        st.caption(f'共 {len(items)} 条')
+        st.caption(f'本页 {len(items)} 条')
         for m in items:
             _mr = m.get('miss_reason') or ''
             _st_txt = ('✅ 已掌握' if m['mastered']
@@ -1406,6 +1447,9 @@ elif page == '📖 错题本':
                         if st.button(f'🗑️ 删除这条错题 #{m["id"]}', key=f'del_{m["id"]}'):
                             st.session_state[_ck] = True
                             st.rerun()
+
+        st.divider()
+        _mk_pager('bottom')
 
 
 # ============== 页面 3: 复习计划 ==============

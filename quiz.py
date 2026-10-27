@@ -1340,7 +1340,8 @@ def grade_paper(pid: int, subject: str, close_reason: str = 'manual') -> dict:
                      ('done', right, score, datetime.now().isoformat(timespec='seconds'),
                       close_reason, pid))
     pushed = push_wrong_to_mistakes(pid, subject)
-    return {'ok': True, 'right': right, 'total': total, 'score': score,
+    # wrong 以前没返回, 调用方只能自己拿 total-right 算, 容易写成 get('wrong') 拿到 None
+    return {'ok': True, 'right': right, 'wrong': total - right, 'total': total, 'score': score,
             'pending_ai': pending_ai, 'pushed': pushed['count'], 'pairs': pushed['pairs'],
             'timeout_cnt': timeout_cnt, 'close_reason': close_reason}
 
@@ -1355,6 +1356,16 @@ def push_wrong_to_mistakes(pid: int, subject: str) -> dict:
     pairs = []
     for it in data.get('items', []):
         if it['correct'] == 1:
+            continue
+        # 同一道题只在错题本里留一条: 判卷自动推过之后, 重复调用(重试/别处再推)不再新增
+        _old = None
+        if it.get('uid'):
+            try:
+                _old = db.mistake_by_uid(it['uid'])
+            except Exception:
+                _old = None
+        if _old:
+            pairs.append((_old['id'], it['id']))   # 讲解图照挂, 只是不重复入库
             continue
         miss = it.get('miss_reason') or ''
         # 未做原因要写成孩子看得懂的话, 不能只存一个 timeout 字段
