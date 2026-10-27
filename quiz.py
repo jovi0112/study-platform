@@ -23,6 +23,13 @@ BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 CALENDAR_PATH = os.path.join(DATA_DIR, 'quiz_calendar.json')
 
+# 模块版本: app.py 启动时会核对。
+# 为什么需要: Streamlit 只热重载主脚本, import 进来的模块不会重载。
+# 于是会出现"主脚本已经是新版、进程里的 quiz 还是旧对象"的错位,
+# 表现为 AttributeError: module 'quiz' has no attribute 'phase_options' 整页崩。
+# 加了这个号, 页面能明确说出"是后台旧模块, 不是代码坏了", 并降级显示。
+MODULE_VER = 2
+
 SUBJECTS = ['数学', '英语', '语文']
 BANK_FILES = {
     '数学': 'question_bank_math.json',

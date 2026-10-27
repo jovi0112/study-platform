@@ -73,6 +73,58 @@ st.set_page_config(
 
 # 初始化数据库
 db.init_db()
+# 每日测试模块的表在下面"模块自检"之后建, 免得旧模块缺函数时先崩在这里
+
+# ============== 模块新旧自检(结构性防御) ==============
+# Streamlit 只热重载主脚本 app.py, 被 import 的 quiz.py / diagram.py 不会重载。
+# 于是"新界面 + 进程里的旧模块"会撞出 AttributeError, 整页变红报错 —— 用户看到的就是
+# "一打开就报错", 只有英文 traceback, 完全不知道该点哪里。
+# 这里的顺序是: 探一遍 -> 缺了就自动 reload 一次(磁盘文件通常已经是新的) -> 还缺才说人话停下。
+_QUIZ_NEED = ('SUBJECTS', 'TYPE_NAMES', 'init_quiz_db', 'create_paper', 'pick_questions',
+              'save_answer', 'grade_paper', 'get_paper', 'list_papers', 'get_mastery',
+              'wrong_summary', 'scope_stats', 'progress_hint', 'md_safe',
+              'current_phase', 'get_offset', 'set_offset',
+              # 手动指定章节(2026-10-27)
+              'phase_options', 'set_manual', 'clear_manual', 'get_manual',
+              'phase_log', 'manual_summary',
+              # 讲解图(2026-10-27)
+              'diagram_is_old', 'render_mistake_diagram', 'gen_diagram',
+              'gen_diagram_for_mistake', 'gen_diagrams_for_paper', 'sync_diagrams_to_mistakes')
+
+
+def _quiz_missing():
+    return [n for n in _QUIZ_NEED if not hasattr(quiz, n)]
+
+
+_MISSING_API = _quiz_missing()
+if _MISSING_API:
+    # 先尝试自己修: 进程里的模块对象是旧的, 但磁盘上的 quiz.py 通常已经是新的
+    try:
+        import importlib
+        importlib.reload(quiz)
+        _MISSING_API = _quiz_missing()
+    except Exception as _e:      # reload 都失败就只能让用户重启
+        _MISSING_API = _MISSING_API or ['reload 失败：%s' % _e]
+
+HAS_MANUAL_CHAPTER = all(hasattr(quiz, n) for n in
+                         ('phase_options', 'set_manual', 'clear_manual', 'get_manual',
+                          'phase_log', 'manual_summary'))
+HAS_DIAGRAM = all(hasattr(quiz, n) for n in
+                  ('render_mistake_diagram', 'gen_diagram', 'gen_diagram_for_mistake',
+                   'diagram_is_old', 'gen_diagrams_for_paper')) and hasattr(diagram, 'render_svg')
+
+if _MISSING_API:
+    st.error(
+        '后台服务还在跑旧版本的 quiz 模块（缺 '
+        + '、'.join(_MISSING_API[:3]) + ('…' if len(_MISSING_API) > 3 else '')
+        + '），所以这页打不开。\n\n'
+        '**这不是你的操作问题，代码本身是对的** —— 是运行中的服务没重启，内存里还是老模块。'
+        '我试过自动重载一次，没成功。\n\n'
+        '- 线上（Streamlit Cloud）：右下角 **Manage app → Reboot app**，等 30 秒刷新。\n'
+        '- 本地：关掉跑 streamlit 的那个窗口，重新 `streamlit run app.py`。'
+    )
+    st.stop()
+
 # 每日测试模块的表(试卷/题目/掌握度/AI 题库)
 quiz.init_quiz_db()
 
@@ -448,69 +500,75 @@ if page == '📝 每日测试':
                 st.warning(f'{_s}: 教学日历没读到, 检查 data/quiz_calendar.json')
 
     # ---- 手动指定章节(学校跳着讲时用) ----
-    with st.expander('📌 学校跳着讲？手动指定章节（选完长期生效，每次改动都记录在案）'):
-        _ms = st.selectbox('哪一科', quiz.SUBJECTS, key='qz_man_subject')
-        _opts = quiz.phase_options(_ms)
-        if not _opts:
-            st.warning('这一科的教学日历是空的，没法指定')
-        else:
-            _cur = quiz.get_manual(_ms)
-            # 控件 key 里带上"当前已存状态"的指纹: 保存/恢复后指纹变化 -> 控件按库里真实状态重建,
-            # 否则会出现"已改回自动, 界面还显示旧选择"的假象(Streamlit 的 widget 状态按 key 复用)
-            _fp = f"{_cur.get('set_at', '')}|{','.join(map(str, _cur.get('indices') or []))}"
-            _labels = [f"第{i}段 · {o['label']}（{o['from']} ~ {o['to']}）" for i, o in enumerate(_opts)]
-            _picked = st.multiselect(
-                '现在学校在讲哪几段？（可多选，最多 3 段；选了就按这个出题，不再按日期推算）',
-                _labels,
-                default=[_labels[i] for i in (_cur.get('indices') or []) if 0 <= i < len(_labels)],
-                key=f'qz_man_phases_{_ms}_{_fp}')
-            _picked_idx = [_labels.index(x) for x in _picked]
+    if not HAS_MANUAL_CHAPTER:
+        # 后台是旧模块时不要整块崩, 说清原因并降级
+        with st.expander('📌 学校跳着讲？手动指定章节（后台未就绪）'):
+            st.warning('这块要新版 quiz 模块才能用，当前进程里还是旧模块。'
+                       '按页面最上面的提示重启一下服务就好，其它功能不受影响。')
+    else:
+        with st.expander('📌 学校跳着讲？手动指定章节（选完长期生效，每次改动都记录在案）'):
+            _ms = st.selectbox('哪一科', quiz.SUBJECTS, key='qz_man_subject')
+            _opts = quiz.phase_options(_ms)
+            if not _opts:
+                st.warning('这一科的教学日历是空的，没法指定')
+            else:
+                _cur = quiz.get_manual(_ms)
+                # 控件 key 里带上"当前已存状态"的指纹: 保存/恢复后指纹变化 -> 控件按库里真实状态重建,
+                # 否则会出现"已改回自动, 界面还显示旧选择"的假象(Streamlit 的 widget 状态按 key 复用)
+                _fp = f"{_cur.get('set_at', '')}|{','.join(map(str, _cur.get('indices') or []))}"
+                _labels = [f"第{i}段 · {o['label']}（{o['from']} ~ {o['to']}）" for i, o in enumerate(_opts)]
+                _picked = st.multiselect(
+                    '现在学校在讲哪几段？（可多选，最多 3 段；选了就按这个出题，不再按日期推算）',
+                    _labels,
+                    default=[_labels[i] for i in (_cur.get('indices') or []) if 0 <= i < len(_labels)],
+                    key=f'qz_man_phases_{_ms}_{_fp}')
+                _picked_idx = [_labels.index(x) for x in _picked]
 
-            # 二级：段内再缩到具体知识点（学校可能连小节都跳）
-            _topics_pool = []
-            for _i2 in _picked_idx:
-                for _t in _opts[_i2]['topics']:
-                    if _t not in _topics_pool:
-                        _topics_pool.append(_t)
-            _topics_sel = []
-            if _topics_pool:
-                _def_topics = [t for t in (_cur.get('topics') or []) if t in _topics_pool] or _topics_pool
-                _topics_sel = st.multiselect(
-                    '再细一点：本段里只练哪些知识点？（默认全选，不细就用默认）',
-                    _topics_pool, default=_def_topics,
-                    key=f'qz_man_topics_{_ms}_{_fp}_{hash(tuple(_picked_idx)) % 9999}')
-            _note = st.text_input('备注（为什么改，给自己留个说明，可不填）',
-                                  value=_cur.get('note', ''), key=f'qz_man_note_{_ms}')
+                # 二级：段内再缩到具体知识点（学校可能连小节都跳）
+                _topics_pool = []
+                for _i2 in _picked_idx:
+                    for _t in _opts[_i2]['topics']:
+                        if _t not in _topics_pool:
+                            _topics_pool.append(_t)
+                _topics_sel = []
+                if _topics_pool:
+                    _def_topics = [t for t in (_cur.get('topics') or []) if t in _topics_pool] or _topics_pool
+                    _topics_sel = st.multiselect(
+                        '再细一点：本段里只练哪些知识点？（默认全选，不细就用默认）',
+                        _topics_pool, default=_def_topics,
+                        key=f'qz_man_topics_{_ms}_{_fp}_{hash(tuple(_picked_idx)) % 9999}')
+                _note = st.text_input('备注（为什么改，给自己留个说明，可不填）',
+                                      value=_cur.get('note', ''), key=f'qz_man_note_{_ms}')
 
-            st.caption(f"当前生效：**{quiz.manual_summary(_ms) or '按教学日历自动'}**")
+                st.caption(f"当前生效：**{quiz.manual_summary(_ms) or '按教学日历自动'}**")
 
-            _b1, _b2 = st.columns(2)
-            with _b1:
-                if st.button('✅ 保存并立即按这个出题', type='primary', use_container_width=True,
-                             key=f'qz_man_save_{_ms}', disabled=not _picked_idx):
-                    _r = quiz.set_manual(_ms, _picked_idx, _topics_sel, _note)
-                    if _r['ok']:
+                _b1, _b2 = st.columns(2)
+                with _b1:
+                    if st.button('✅ 保存并立即按这个出题', type='primary', use_container_width=True,
+                                 key=f'qz_man_save_{_ms}', disabled=not _picked_idx):
+                        _r = quiz.set_manual(_ms, _picked_idx, _topics_sel, _note)
+                        if _r['ok']:
+                            for _k in ('qz_questions', 'qz_pid', 'qz_subject_done', 'qz_report'):
+                                st.session_state[_k] = None
+                            st.success(_r['msg'])
+                            st.rerun()
+                        else:
+                            st.error(_r['msg'])
+                with _b2:
+                    if st.button('↩️ 改回按日历自动', use_container_width=True, key=f'qz_man_clear_{_ms}'):
+                        _r = quiz.clear_manual(_ms, _note)
                         for _k in ('qz_questions', 'qz_pid', 'qz_subject_done', 'qz_report'):
                             st.session_state[_k] = None
-                        st.success(_r['msg'])
+                        st.info(_r['msg'])
                         st.rerun()
-                    else:
-                        st.error(_r['msg'])
-            with _b2:
-                if st.button('↩️ 改回按日历自动', use_container_width=True, key=f'qz_man_clear_{_ms}'):
-                    _r = quiz.clear_manual(_ms, _note)
-                    for _k in ('qz_questions', 'qz_pid', 'qz_subject_done', 'qz_report'):
-                        st.session_state[_k] = None
-                    st.info(_r['msg'])
-                    st.rerun()
 
-            _logs = quiz.phase_log(_ms, limit=8)
-            if _logs:
-                st.markdown('**改动记录**（最近的在上）')
-                for _lg in _logs:
-                    _what = '手动指定' if _lg['action'] == 'set_manual' else '改回自动'
-                    st.caption(f"{_lg['at'][:16].replace('T', ' ')} · {_what}：{_lg['after_text']}"
-                               + (f"　（备注：{_lg['note']}）" if _lg.get('note') else ''))
+                _logs = quiz.phase_log(_ms, limit=8)
+                if _logs:
+                    st.markdown('**改动记录**（最近的在上）')
+                    for _lg in _logs:
+                        _what = '手动指定' if _lg['action'] == 'set_manual' else '改回自动'
+                        st.caption(f"{_lg['at'][:16].replace('T', ' ')} · {_what}：{_lg['after_text']}"
+                                   + (f"　（备注：{_lg['note']}）" if _lg.get('note') else ''))
 
     st.divider()
 
@@ -605,7 +663,7 @@ if page == '📝 每日测试':
             # 判完立刻给错题画讲解图(并发; 同一道题画过就复用, 不再花 AI 调用)
             _wrong_now = [x for x in quiz.get_paper(_pid)['items'] if x.get('correct') != 1]
             _rep['draw_failed'] = 0
-            if _wrong_now:
+            if _wrong_now and HAS_DIAGRAM:
                 try:
                     _st = st.status('判卷完成，正在画讲解图…', expanded=True)
                     _dstat = quiz.gen_diagrams_for_paper(
@@ -652,7 +710,7 @@ if page == '📝 每日测试':
                     if _it.get('explain'):
                         st.caption('讲解: ' + quiz.md_safe(_it['explain']))
                     # 讲解思维导图: 错题默认都配一张
-                    if not _it['correct']:
+                    if not _it['correct'] and HAS_DIAGRAM:
                         _svg = quiz.render_mistake_diagram(_it)
                         if _svg:
                             st.markdown('**🧭 讲解图**')
@@ -922,7 +980,12 @@ elif page == '📖 错题本':
                                f" | 上次复习 {fmt_when(m.get('last_reviewed')) if m.get('last_reviewed') else '还没复习过'}")
 
                 with tabs[1]:
-                    _svg = quiz.render_mistake_diagram(m)
+                    if not HAS_DIAGRAM:
+                        st.warning('讲解图要新版后台模块才能用，当前进程里还是旧模块。'
+                                   '重启服务后这里就会恢复。')
+                        _svg = ''
+                    else:
+                        _svg = quiz.render_mistake_diagram(m)
                     if _svg:
                         st.caption('一张图看清解法主线: 已知条件 → 关键判断 → 分情况 → 逐条结论; '
                                    '图最下面的红色卡片标出你错在哪一步、为什么错')
