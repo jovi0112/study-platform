@@ -168,7 +168,9 @@ _SCAN_NEED = ('cropper_ready', 'ocr_boxes', 'lines_in_rect', 'normalize_rect',
               # 方向 + 去表格装饰（2026-10-28 真卷实测后加）
               'crop_from', 'guess_sideways', 'plainify',
               # 框太大提醒（2026-10-28 下午；名字清单漏过一次它，所以下面还有版本号兜底）
-              'box_ratio', 'module_ver_issue')
+              'box_ratio', 'module_ver_issue',
+              # 失败后单题重认（漏了它 = 旧模块下点「只重认这道」再红一次）
+              'ai_retry_one')
 
 _SCAN_WANT = 3      # 要求 scan.MODULE_VER >= 3（v3 才有 box_ratio）
 _LLM_WANT = 2       # 要求 llm.MODULE_VER >= 2（v2 才有 error_code / auto_verify / on_wait）

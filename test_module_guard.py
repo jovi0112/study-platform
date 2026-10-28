@@ -23,6 +23,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 OLD_COMMIT = '172fba7'          # 手动指定章节/讲解图都还没有的那个版本
+OLD_SCAN_COMMIT = '024d632'     # scan v2: 有旋转/crop_from, 但还没有 box_ratio
 PASS, FAIL = [], []
 
 
@@ -37,7 +38,8 @@ def make_dir(tag):
         shutil.rmtree(d)
     os.makedirs(os.path.join(d, 'data'))
     os.makedirs(os.path.join(d, '.streamlit'))
-    for f in ('app.py', 'db.py', 'llm.py', 'ocr.py', 'web_search.py', 'backup.py', 'diagram.py'):
+    for f in ('app.py', 'db.py', 'llm.py', 'ocr.py', 'scan.py', 'web_search.py',
+              'backup.py', 'diagram.py', 'quiz.py'):
         shutil.copy(os.path.join(HERE, f), d)
     for f in os.listdir(os.path.join(HERE, 'data')):
         if f.endswith('.json'):
@@ -53,31 +55,50 @@ def old_quiz_text():
                           capture_output=True, text=True, encoding='utf-8').stdout
 
 
-def run_case(d, preload_old, quiet=False):
-    """preload_old=True 表示先 import 旧 quiz 占住 sys.modules, 再把磁盘换成新版"""
+def old_scan_text():
+    return subprocess.run(['git', 'show', OLD_SCAN_COMMIT + ':scan.py'], cwd=HERE,
+                          capture_output=True, text=True, encoding='utf-8').stdout
+
+
+def run_case(d, preload_old, mod='quiz', probe_attr='phase_options', nav='', quiet=False):
+    """preload_old=True 表示先 import 旧模块占住 sys.modules, 再把磁盘换成新版
+    nav: 跑完首页后再切到哪个页面(旧模块提示只在该页渲染, 不导航就收不到)"""
     code = r'''
 import os, sys, json
 d = sys.argv[1]; preload = sys.argv[2] == '1'
+mod = sys.argv[3]; attr = sys.argv[4]; nav = sys.argv[5]
 sys.path.insert(0, d)
 os.chdir(d)
 if preload:
-    import quiz as _q
-    before = hasattr(_q, 'phase_options')
-    open(os.path.join(d, 'quiz.py'), 'w', encoding='utf-8').write(
-        open(os.path.join(d, 'new_quiz.py'), encoding='utf-8').read())
+    m = __import__(mod)
+    before = hasattr(m, attr)
+    open(os.path.join(d, mod + '.py'), 'w', encoding='utf-8').write(
+        open(os.path.join(d, 'new_' + mod + '.py'), encoding='utf-8').read())
 from streamlit.testing.v1 import AppTest
 at = AppTest.from_file(os.path.join(d, 'app.py'), default_timeout=90)
 at.run()
+if nav:
+    # 画框区要先有"已上传的照片"才会走到自检那一段, 造一张占位图
+    os.makedirs(os.path.join(d, 'uploads'), exist_ok=True)
+    from PIL import Image
+    Image.new('RGB', (600, 800), 'white').save(os.path.join(d, 'uploads', '_probe.jpg'))
+    at.session_state['img_rel'] = '_probe.jpg'
+    for r in at.sidebar.radio:
+        hit = [o for o in list(getattr(r, 'options', []) or []) if nav in str(o)]
+        if hit:
+            r.set_value(hit[0]); at.run(); break
 out = {'exc': [(e.type, str(e.value)[:150]) for e in at.exception],
-       'err': [e.value[:120] for e in at.error],
+       'err': [e.value[:400] for e in at.error],
+       'warn': [w.value[:400] for w in at.warning],
        'sub': [s.value for s in at.subheader][:4]}
 if preload:
-    import quiz as _q2
+    # importlib.reload 是就地更新同一个对象, 所以这里拿到的还是原来那个
+    m2 = __import__(mod)
     out['before'] = before
-    out['after'] = hasattr(_q2, 'phase_options')
+    out['after'] = hasattr(m2, attr)
 print('@@' + json.dumps(out, ensure_ascii=False))
 '''
-    r = subprocess.run([PY, '-c', code, d, '1' if preload_old else '0'],
+    r = subprocess.run([PY, '-c', code, d, '1' if preload_old else '0', mod, probe_attr, nav],
                        capture_output=True, text=True, encoding='utf-8', errors='replace')
     for ln in (r.stdout or '').splitlines():
         if ln.startswith('@@'):
@@ -136,6 +157,80 @@ if need:
     miss = sorted(used - set(need))
     ck(not miss, '没有漏检的 quiz 调用', miss)
     print('     名单 %d 项, app.py 实际调用 %d 项' % (len(need), len(used)))
+
+print('=== E. scan 磁盘旧 + 内存旧(2026-10-28 线上真实翻车现场, 不能崩成红 traceback) ===')
+d = make_dir('e')
+with open(os.path.join(d, 'scan.py'), 'w', encoding='utf-8') as f:
+    f.write(old_scan_text())
+r = run_case(d, preload_old=False, mod='scan', probe_attr='box_ratio', nav='拍照录入')
+ck(r is not None, 'E 能跑起来')
+if r:
+    ck(not r['exc'], 'E 没有抛异常(不是整页 AttributeError)', r['exc'])
+    msg = ''.join(r['err'] + r['warn'])
+    ck('旧模块' in msg, 'E 提示里点名"旧模块"', msg[:100])
+    ck('Reboot' in msg, 'E 提示里给了 Reboot 办法', msg[:100])
+
+print('=== F. scan 磁盘新 + 内存旧(线上最常见, 要能自愈) ===')
+d = make_dir('f')
+with open(os.path.join(d, 'scan.py'), 'w', encoding='utf-8') as f:
+    f.write(old_scan_text())
+shutil.copy(os.path.join(HERE, 'scan.py'), os.path.join(d, 'new_scan.py'))
+r = run_case(d, preload_old=True, mod='scan', probe_attr='box_ratio')
+ck(r is not None, 'F 能跑起来')
+if r:
+    ck(r.get('before') is False, 'F 起点确实是旧模块(没有 box_ratio)')
+    ck(r.get('after') is True, 'F 自动 reload 后拿到新模块')
+    ck(not r['exc'], 'F 没有抛异常', r['exc'])
+    ck(not r['err'] and not r['warn'], 'F 没有报警(自愈成功, 用户无感)',
+       (r['err'] + r['warn'])[:2])
+
+print('=== G. 结构断言: 名单覆盖 + 版本要求同步(这条是防复发的核心) ===')
+src = io.open(os.path.join(HERE, 'app.py'), encoding='utf-8').read()
+
+
+def _top_list(name):
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return [e.value for e in node.value.elts]
+    return None
+
+
+def _top_int(name):
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            try:
+                return ast.literal_eval(node.value)
+            except Exception:
+                return None
+    return None
+
+
+import re
+import scan as _scan
+import llm as _llm
+
+_scan_need = _top_list('_SCAN_NEED')
+ck(_scan_need is not None, '找得到 _SCAN_NEED 定义')
+if _scan_need:
+    used = {n for n in re.findall(r'\bscan\.([A-Za-z_][A-Za-z0-9_]*)', src)
+            if n not in ('py', 'MODULE_VER')}
+    miss = sorted(used - set(_scan_need))
+    ck(not miss, 'app.py 里每个 scan.xxx 调用都在自检名单里', miss)
+    ck('box_ratio' in _scan_need, 'box_ratio 在名单里(2026-10-28 漏的就是它)')
+    ck(all(hasattr(_scan, n) for n in _scan_need), '名单里每个名字 scan 都真有',
+       [n for n in _scan_need if not hasattr(_scan, n)])
+
+# 版本号必须两边同步: 加函数只 bump 模块、忘了改 app.py 的要求值 → 旧模块又能混过去
+ck(_top_int('_SCAN_WANT') == getattr(_scan, 'MODULE_VER', None),
+   'app.py 的 _SCAN_WANT 等于 scan.MODULE_VER',
+   '%s vs %s' % (_top_int('_SCAN_WANT'), getattr(_scan, 'MODULE_VER', None)))
+ck(_top_int('_LLM_WANT') == getattr(_llm, 'MODULE_VER', None),
+   'app.py 的 _LLM_WANT 等于 llm.MODULE_VER',
+   '%s vs %s' % (_top_int('_LLM_WANT'), getattr(_llm, 'MODULE_VER', None)))
 
 print('\n===== 汇总: 通过 %d / 失败 %d =====' % (len(PASS), len(FAIL)))
 for f in FAIL:
