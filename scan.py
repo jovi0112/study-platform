@@ -39,7 +39,9 @@ from PIL import Image, ImageOps
 import ocr
 import llm
 
-MODULE_VER = 3      # v3: 加 box_ratio(框太大会不会圈了整页) 2026-10-28 下午
+MODULE_VER = 5      # v5: 加 edge_cut(框切到字要提醒) 2026-10-28 下午
+#                      v4: 横放照片的草稿按横向重排(不再整段倒序挤成一行) 2026-10-28 下午
+#                      v3: 加 box_ratio(框太大会不会圈了整页) 2026-10-28 下午
 #                      v2: 加旋转 / crop_from / guess_sideways / plainify (2026-10-28 真卷)
 
 # 一次最多框多少道(防止误操作框出几百个)
@@ -96,15 +98,31 @@ def guess_sideways(boxes: list) -> bool:
     **所以别用"哪个方向认得多"来猜方向, 会猜错**; 用长宽比。
 
     只做提示, 不自动转 —— 转错了更麻烦, 让用户自己按一下。
+
+    判据放宽过(2026-10-28 下午): 原来是"竖条 ≥3 条且占一半以上", 真卷里带表格时
+    表格里的小数字会被认成短框, 竖条占比掉到 50% 以下就不报警了 —— 明明整页是横的,
+    界面却一声不吭。改成"竖条比横条多"就算, 宁可多提示一次也别漏。
     """
     if not boxes:
         return False
     tall = 0
+    wide = 0
     for b in boxes:
         w = max(1.0, b['x1'] - b['x0'])
-        h = b['y1'] - b['y0']
+        h = max(1.0, b['y1'] - b['y0'])
         if h / w >= 3.0:
             tall += 1
+        elif w / h >= 3.0:
+            wide += 1
+    return tall >= 3 and tall > wide
+
+
+def _boxes_sideways(boxes: list) -> bool:
+    """这批框里"竖长条"是不是主角(只看长度, 不看数量比例)"""
+    if not boxes:
+        return False
+    tall = sum(1 for b in boxes
+               if (b['y1'] - b['y0']) / max(1.0, b['x1'] - b['x0']) >= 3.0)
     return tall >= 3 and tall >= len(boxes) * 0.5
 
 
@@ -178,10 +196,65 @@ def _group_rows(boxes: list) -> list:
     return rows
 
 
+def _rows_to_lines(boxes: list) -> list:
+    """按"行→列"把框拼成文本行(同一行内按 x 从左到右)"""
+    if not boxes:
+        return []
+    bs = sorted(boxes, key=lambda x: x['y0'])
+    rows = _group_rows(bs)
+    return [' '.join(x['text'] for x in row) for row in rows]
+
+
+# 像"题号开头"的样子: 23.  (1)  1)  第3题
+_START_RE = re.compile(r'^\s*[（(]?\s*\d{1,3}\s*[）).．、]|^\s*第\s*\d{1,3}\s*题')
+_MAIN_NO_RE = re.compile(r'^\s*\d{1,3}\s*[.．、]')      # 23. 这种"大题号"
+_SUB_NO_RE = re.compile(r'^\s*[（(]\s*(\d{1,3})\s*[）)]')  # （1）这种"小问号"
+
+
+def _order_score(lines: list) -> int:
+    """
+    两份候选草稿, 哪份"读起来"更像正常题面。
+
+    只用于横放照片: 那种情况下按 x 排会得到正序或倒序两种结果, 而 OCR 本身的文字是对的,
+    所以只能靠版式特征判断。三个判据(2026-10-28 真卷 + 合成用例都验过):
+    1) 小问号是否递增 —— (1)(2)(3) 顺序念才对, 倒着念就是 3,2,1;
+    2) 首行是不是"23."这种大题号 —— 页首最典型的特征;
+    3) 末行是不是以问号结尾 —— 页尾常是最后一个小问。
+    """
+    if not lines:
+        return -1
+    s = 0
+    nums = []
+    for ln in lines[:8]:
+        m = _SUB_NO_RE.match((ln or '').strip())
+        if m:
+            nums.append(int(m.group(1)))
+    for a, b in zip(nums, nums[1:]):
+        if b == a + 1:
+            s += 2
+        elif b < a:
+            s -= 2
+    first = (lines[0] or '').strip()
+    last = (lines[-1] or '').strip()
+    if _MAIN_NO_RE.match(first):
+        s += 3
+    elif _SUB_NO_RE.match(first):
+        s += 1
+    if last.endswith(('？', '?')):
+        s += 1
+    if len(first) <= 4:          # "元）""700" 这种碎片, 多半是从页尾开头的倒序
+        s -= 1
+    return s
+
+
 def lines_in_rect(boxes: list, rect: tuple) -> str:
     """
     框内有哪些文字行。判据: 行的中心点落在框内。
     返回按"行→列"顺序拼好的文本(同一行内按 x 从左到右)。
+
+    照片横着存时每个文字行会被认成"竖长条"(实测 59x437), 竖条之间 y 几乎一样,
+    这时按 y 排等于没排 —— 结果整段被拼成一行, 而且是从页尾开头往回念。
+    所以竖条占多数时把坐标先转 90° 再排, 正序倒序各拼一份, 取"首行像题目开头"的那份。
     """
     if not boxes or not rect:
         return ''
@@ -194,12 +267,14 @@ def lines_in_rect(boxes: list, rect: tuple) -> str:
             hit.append(bx)
     if not hit:
         return ''
-    hit.sort(key=lambda x: x['y0'])
-    rows = _group_rows(hit)
-    lines = []
-    for row in rows:
-        lines.append(' '.join(x['text'] for x in row))
-    return '\n'.join(lines)
+    if not _boxes_sideways(hit):
+        return '\n'.join(_rows_to_lines(hit))
+
+    # 竖条: (x, y) -> (y, x) 让每根竖条变成一行; 再翻一个方向得到另一种顺序
+    fwd = [dict(b, x0=b['y0'], x1=b['y1'], y0=b['x0'], y1=b['x1']) for b in hit]
+    rev = [dict(b, x0=b['y0'], x1=b['y1'], y0=-b['x1'], y1=-b['x0']) for b in hit]
+    a, c = _rows_to_lines(fwd), _rows_to_lines(rev)
+    return '\n'.join(a if _order_score(a) >= _order_score(c) else c)
 
 
 # ============== 裁剪 ==============
@@ -246,6 +321,37 @@ def box_ratio(rect: tuple, img_size: tuple) -> float:
         return max(0.0, min(1.0, area / (w * h)))
     except (TypeError, ValueError, IndexError):
         return 0.0
+
+
+def edge_cut(boxes: list, rect: tuple, margin: int = 6) -> list:
+    """
+    框的哪几条边"从文字中间穿过去"了 —— 说明这一侧的字被裁掉了。
+
+    2026-10-28 真卷实测踩到的坑: 用户框住的那道题，左边框压在第 3 个字上，
+    「23.小王上周五买进…」和后面的「（1）」都被切掉半个，
+    于是 AI 抄回来的题面天然缺字 —— 而这看起来像是"模型识别差"。
+    这种损失是拍大头照那一步造成的，早点说一句比换三个模型都有用。
+
+    判据: 文字框和某条边有交集，且文字框明显跨过这条边(两边都伸出去 margin 像素)。
+    返回 ['左'], ['左','上'] 这样的列表; 没问题返回 []。
+    """
+    if not boxes or not rect:
+        return []
+    l, t, r, b = rect
+    cut = set()
+    for bx in boxes:
+        x0, x1, y0, y1 = bx['x0'], bx['x1'], bx['y0'], bx['y1']
+        if x1 <= l or x0 >= r or y1 <= t or y0 >= b:
+            continue          # 完全在框外
+        if x0 < l - margin and x1 > l + margin:
+            cut.add('左')
+        if x1 > r + margin and x0 < r - margin:
+            cut.add('右')
+        if y0 < t - margin and y1 > t + margin:
+            cut.add('上')
+        if y1 > b + margin and y0 < b - margin:
+            cut.add('下')
+    return [e for e in ('上', '下', '左', '右') if e in cut]
 
 
 def crop_image(abs_path: str, rect: tuple) -> "Image.Image":

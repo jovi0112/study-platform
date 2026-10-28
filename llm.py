@@ -11,7 +11,8 @@ from typing import Optional
 
 # 界面(app.py)会拿这个值判断进程里是不是旧模块 —— 改了对外接口就 bump, 并在 app.py 的
 # _LLM_WANT 里同步. 背景见 scan.module_ver_issue 的注释(线上"新界面配旧模块"那次事故).
-MODULE_VER = 2      # v2: 加 error_code / auto_verify / _vision_call(on_wait) 2026-10-28
+MODULE_VER = 3      # v3: 看图模型可在界面换+可测 / 秒拒快收敛 / 校对不再丢孩子的作答 2026-10-28
+#                      v2: 加 error_code / auto_verify / _vision_call(on_wait) 2026-10-28
 
 
 def _read_secret(key: str, default: str = '') -> str:
@@ -62,6 +63,44 @@ VISION_BASE_URL = _clean_secret('STUDY_VISION_BASE_URL', '')
 VISION_MODEL = _clean_secret('STUDY_VISION_MODEL', '')
 
 
+def vision_model() -> str:
+    """
+    当前真正用的看图模型名。
+
+    顺序: 界面上选的(存在 settings 表) > Secrets 里的 STUDY_VISION_MODEL。
+    为什么要多这一层: 模型名只能在 Secrets 里改, 改完要等云端重启; 而"这个模型今天排不上队"
+    是随时会变的事 —— 让家长在「设置」里点两下就能换, 比教他改 TOML 靠谱。
+    """
+    try:
+        import db
+        ov = (db.get_setting('vision_model', '') or '').strip()
+        if ov:
+            return ov
+    except Exception:
+        pass
+    return VISION_MODEL
+
+
+def vision_host() -> str:
+    """通道域名, 报错时说清楚"是哪家不给你名额" —— 只说'限流'等于什么都没说"""
+    u = (VISION_BASE_URL or '').strip()
+    for pre in ('https://', 'http://'):
+        if u.startswith(pre):
+            u = u[len(pre):]
+    return u.split('/')[0] or '(未填 STUDY_VISION_BASE_URL)'
+
+
+def set_vision_model(model: str):
+    """界面换模型。传空串 = 回到 Secrets 里的默认值。"""
+    import db
+    m = (model or '').strip()
+    if m:
+        db.set_setting('vision_model', m)
+    else:
+        db.set_setting('vision_model', '')
+
+
+
 def _non_ascii_cfg_problem() -> str:
     """
     检查视觉配置里是否仍有非英文字符(自动清洗救不回来的, 比如中间夹了汉字).
@@ -69,7 +108,7 @@ def _non_ascii_cfg_problem() -> str:
     """
     for name, val in (('STUDY_VISION_API_KEY', VISION_API_KEY),
                       ('STUDY_VISION_BASE_URL', VISION_BASE_URL),
-                      ('STUDY_VISION_MODEL', VISION_MODEL)):
+                      ('STUDY_VISION_MODEL', vision_model())):
         if val and not val.isascii():
             return (f"{name} 里混入了非英文字符(多半是复制时带上了中文引号/汉字/全角空格)。"
                     "请到 Streamlit Cloud 的 Secrets 把这一行删掉重新粘贴, "
@@ -86,22 +125,23 @@ def vision_status() -> dict:
     看图功能状态. 返回 {enabled, reason, model, base_url}
     reason 是给人看的话, UI 直接显示即可(避免"配置错了却提示成功"的假象)
     """
+    _m = vision_model()
     if not VISION_API_KEY:
         return {'enabled': False, 'reason': '未配 Key',
-                'model': VISION_MODEL or '(未填)', 'base_url': VISION_BASE_URL or '(未填)'}
-    if not VISION_BASE_URL or not VISION_MODEL:
+                'model': _m or '(未填)', 'base_url': VISION_BASE_URL or '(未填)'}
+    if not VISION_BASE_URL or not _m:
         return {'enabled': False,
                 'reason': 'Key 有了, 但还缺 STUDY_VISION_BASE_URL 或 STUDY_VISION_MODEL',
-                'model': VISION_MODEL or '(未填)', 'base_url': VISION_BASE_URL or '(未填)'}
+                'model': _m or '(未填)', 'base_url': VISION_BASE_URL or '(未填)'}
     if 'deepseek' in VISION_BASE_URL.lower():
         return {'enabled': False,
                 'reason': 'DeepSeek 不支持看图, 请换成通义/智谱/OpenAI/硅基流动等视觉模型',
-                'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
+                'model': _m, 'base_url': VISION_BASE_URL}
     bad = _non_ascii_cfg_problem()
     if bad:
         return {'enabled': False, 'reason': bad,
-                'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
-    return {'enabled': True, 'reason': '已启用', 'model': VISION_MODEL, 'base_url': VISION_BASE_URL}
+                'model': _m, 'base_url': VISION_BASE_URL}
+    return {'enabled': True, 'reason': '已启用', 'model': _m, 'base_url': VISION_BASE_URL}
 
 
 def is_vision_enabled() -> bool:
@@ -131,18 +171,48 @@ _VISION_VERIFY_PROMPT = """你是"校对员"。下面给你一张题目图片和
 3) 页面上不是题目本身的内容(如"班级""姓名""答题纸"这种印刷的表头), 如果草稿里有, 删掉
 4) 分数写成"分子/分母", 乘号用 ×, 除号用 ÷
 5) 只输出修正后的题目文字, 不要解释、不要 Markdown 代码块
-6) 如果草稿已经完全正确, 就原样输出"""
+6) 如果草稿已经完全正确, 就原样输出
+7) 草稿末尾若有"--- 孩子的作答 ---"这一段, **必须原样保留**, 放在最后, 不要删、不要改
+   （实测踩过: 校对那遍会把这一段整段吞掉, 错题本就只剩题干, 判错时看不到孩子怎么算的）"""
+
+
+ANSWER_MARK = '--- 孩子的作答 ---'
+
+
+def _keep_answer_block(draft: str, fixed: str) -> str:
+    """
+    校对完把"孩子的作答"补回来。
+
+    实测(真卷 1023x767, 2026-10-28): 第一遍抄写会把孩子的算式单列成一段,
+    第二遍校对只盯着"题目文字", 于是整段作答消失 —— 32B 和 30B 都这样。
+    作答是错题本判断"错在哪"的核心信息, 丢了比抄错一个字严重得多, 所以代码兜一层。
+    """
+    if not draft or ANSWER_MARK not in draft:
+        return fixed
+    if ANSWER_MARK in (fixed or ''):
+        return fixed
+    tail = draft.split(ANSWER_MARK, 1)[1].strip()
+    if not tail:
+        return fixed
+    return (fixed or '').rstrip() + '\n\n' + ANSWER_MARK + '\n' + tail
 
 
 VISION_WAITS = (0, 15, 30)   # 首次 + 最多两次重试(等 15s / 30s)
+# 被"秒拒"时的等待计划: 只有 0 和 5 秒, 合计约 7 秒就给结论.
+# 判据来自实测(2026-10-28 13:14 线上那次 55.1 秒全失败):
+#   55.1 - (15+30) = 10.1 秒 ≈ 3 次调用各 3 秒 —— 每次都是服务端立刻拒, 根本没有"排队"这回事.
+#   对"模型今天没名额"(1305/429)和"模型名不存在"(20012)这两种, 干等 45 秒纯烧时间:
+#   前者要换模型, 后者要改名, 等多久都不会变。
+FAST_FAIL_WAITS = (0, 5)
+REJECT_SECONDS = 2.5     # 2.5 秒内被拒 = 服务端直接拒, 不是"慢慢排到队尾"
 
-# 超过这个面积就不做第二遍校对(约 1200x750).
-# 实测(真卷 1279x1706 = 218 万像素): 整页抄一遍 17~34 秒, 服务端排队波动极大;
-# 再发一遍校对 = 配额翻倍 + 时间翻倍, 而整页本来就抄得全, 校对收益远小于代价.
-# 单题裁剪块(896x376 = 34 万像素)照常校对两遍 —— 那才是错字高发区.
-# 优先按像素判断: 同样一页, 压缩质量不同体积能差一倍, 像素数不会变.
-VERIFY_MAX_PIXELS = 900_000
-VERIFY_MAX_BYTES = 120 * 1024   # 拿不到尺寸时按体积退而求其次
+# 超过这个面积就不做第二遍校对(约 1000x600).
+# 实测(真卷单题框 1023x767 = 78 万像素, 2026-10-28):
+#   Qwen3-VL-30B-A3B 单遍 11.4 秒 / 两遍 18.9 秒, 题目正文两次几乎一字不差;
+#   而 32B 单遍 33 秒 / 两遍 226 秒(高峰排队), 二校那次反而把"孩子的作答"整段弄丢了。
+# 结论: 大块图的第二遍校对收益 ≈ 0, 代价是配额和时间翻倍 —— 阈值从 90 万降到 60 万。
+VERIFY_MAX_PIXELS = 600_000
+VERIFY_MAX_BYTES = 90 * 1024   # 拿不到尺寸时按体积退而求其次
 
 
 def auto_verify(nbytes: int, pixels: int = None) -> bool:
@@ -166,37 +236,53 @@ def _pixels_of(image_bytes: bytes):
 def _vision_call(client, on_wait=None, **kw):
     """
     带限流重试的视觉模型调用.
-    免费/共享配额的视觉模型在高峰会间歇性 429(错误码 1302/1305),
-    官方口径是"等 15 秒以上重试 1-2 次即可". 这事不该让孩子手动做, 程序自动等+重试.
 
-    on_wait(attempt, seconds): 进入等待前回调. 界面靠它显示"正在排队, 还有 N 秒",
-    否则整段等待是完全静默的 —— 实测 54 秒白屏, 孩子以为卡死了.
+    两种失败要区别对待(2026-10-28 线上实测后改的):
+    - **真排队**(429, 慢): 服务端让你等, 等 15/30 秒重试 1-2 次有意义;
+    - **秒拒**(1305/1302 或模型名不存在, 2.5 秒内回): 这是"这条路走不通", 不是"排在队尾"。
+      前者要换模型, 后者要改名, 等 45 秒只会让孩子盯着白屏。
+    所以第一次就被秒拒时, 后面只再等 5 秒试一次, 合计约 7 秒给结论。
+
+    on_wait(attempt, seconds): 进入等待前回调. 界面靠它显示"正在排队, 还有 N 秒".
     """
     import time as _time
-    last_err = None
-    for i, w in enumerate(VISION_WAITS):
+    plan = list(VISION_WAITS)
+    idx = 0
+    while True:
+        w = plan[idx]
         if w:
             if on_wait:
                 try:
-                    on_wait(i, w)
+                    on_wait(idx, w)
                 except Exception:
                     pass        # 界面回调炸了不能影响重试本身
             _time.sleep(w)
+        t0 = _time.time()
         try:
             return client.chat.completions.create(**kw)
         except Exception as e:
-            msg = str(e)
-            if ('429' in msg or '1302' in msg or '1305' in msg) and i < len(VISION_WAITS) - 1:
-                last_err = e
+            dt = _time.time() - t0
+            code = error_code(str(e))
+            idx += 1
+            if idx >= len(plan):
+                raise
+            if idx == 1 and code in ('rate_limit', 'model_missing') and dt < REJECT_SECONDS:
+                plan = list(FAST_FAIL_WAITS)   # 秒拒: 不再硬等 15/30
+                idx = 1
                 continue
-            raise
-    raise last_err
+            if code not in ('rate_limit', 'timeout'):
+                raise          # 鉴权/余额/模型名错: 重试一百次也一样
 
 
 def error_code(msg: str) -> str:
     """把异常归成几类, 界面据此给不同的下一步建议(别用一句'限流'糊所有情况)"""
     m = (msg or '').lower()
-    if '429' in m or '1302' in m or '1305' in m or 'rate limit' in m:
+    # 模型名不存在: 硅基流动 20012 / OpenAI 风格 model_not_found / 各家 404 文案
+    if ('model does not exist' in m or '20012' in m or 'model_not_found' in m
+            or 'model not found' in m or 'invalid model' in m or 'no such model' in m
+            or ('does not exist' in m and 'model' in m)):
+        return 'model_missing'
+    if '429' in m or '1302' in m or '1305' in m or 'rate limit' in m or '访问量过大' in m:
         return 'rate_limit'
     if 'timeout' in m or 'timed out' in m:
         return 'timeout'
@@ -223,6 +309,7 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
     返回: {'success': bool, 'text': str, 'error': str|None, 'code': str, 'model': str}
     """
     stt = vision_status()
+    _model = vision_model()
     if not stt['enabled']:
         return {'success': False, 'text': '', 'error': f"看图功能未启用: {stt['reason']}",
                 'code': 'disabled', 'model': stt['model']}
@@ -247,7 +334,7 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
         resp = _vision_call(
             client,
             on_wait=on_wait,
-            model=VISION_MODEL,
+            model=_model,
             messages=[
                 {"role": "system", "content": _VISION_PROMPT},
                 {"role": "user", "content": [
@@ -261,7 +348,7 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
         text = (resp.choices[0].message.content or '').strip()
         if not text:
             return {'success': False, 'text': '', 'error': '模型返回空内容',
-                    'code': 'empty_result', 'model': VISION_MODEL}
+                    'code': 'empty_result', 'model': _model}
 
         # ---- 第二遍: 校对(失败不影响结果, 退回第一遍草稿) ----
         verified = False
@@ -270,7 +357,7 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
                 resp2 = _vision_call(
                     client,
                     on_wait=on_wait,
-                    model=VISION_MODEL,
+                    model=_model,
                     messages=[
                         {"role": "system", "content": _VISION_VERIFY_PROMPT},
                         {"role": "user", "content": [
@@ -285,17 +372,17 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
                 )
                 fixed = (resp2.choices[0].message.content or '').strip()
                 if fixed:
-                    text = fixed
+                    text = _keep_answer_block(text, fixed)
                     verified = True
             except Exception:
                 pass  # 校对挂了不算失败, 用第一遍结果
 
         return {'success': True, 'text': text, 'error': None, 'code': 'ok',
-                'verified': verified, 'model': VISION_MODEL}
+                'verified': verified, 'model': _model}
     except Exception as e:
         raw = str(e)
         return {'success': False, 'text': '', 'error': _humanize_error(raw),
-                'code': error_code(raw), 'model': VISION_MODEL}
+                'code': error_code(raw), 'model': _model}
 
 
 # ============== 共享提示词前缀 ==============
@@ -325,14 +412,19 @@ def _default_model():
     }.get(LLM_PROVIDER, 'gpt-4o-mini')
 
 
-def _humanize_error(msg: str) -> str:
+def _humanize_error(msg: str, model: str = '') -> str:
     """把 LLM 原始异常翻译成人话。
 
     措辞只说我们确定的事：
-    - 撞了限流就说"服务商配额排队"，不说"免费档"——型号可能是付费的，说错会误导排查方向；
-    - 超时就说超时，别混进限流里（两者下一步动作不同：超时该重试，鉴权错重试一百次也没用）。
+    - 撞了限流就说"服务商名额"，不说"免费档"——型号可能是付费的，说错会误导排查方向；
+    - 超时就说超时，别混进限流里（两者下一步动作不同：超时该重试，鉴权错重试一百次也没用）；
+    - **必须带上"哪家通道 + 哪个模型 + 服务端原话"**：只说"太挤"，家长没法判断是网络、
+      是模型名写错了、还是该换模型。2026-10-28 那次就是一句"排队中"把真正原因盖住了。
     """
     code = error_code(msg)
+    _m = (model or vision_model())
+    _host = vision_host()
+    raw = (msg or '').replace('\n', ' ')[:120]
     if code == 'bad_secret':
         return ("请求里混入了非英文字符, 发不出去 — 多半是 Key/接口地址复制时带上了"
                 "中文引号或全角空格。请到 Secrets 检查 STUDY_VISION_* 的值, "
@@ -341,17 +433,80 @@ def _humanize_error(msg: str) -> str:
         return ("服务商账户余额不足 — 请到服务商后台充值后再试 "
                "(DeepSeek 最低充 10 元, 按用量扣费)")
     if code == 'auth':
-        return "API Key 无效或已失效 — 请检查 STUDY_VISION_API_KEY 是否填错/被删除"
+        return f"API Key 无效或已失效（{_host}）— 请检查 STUDY_VISION_API_KEY 是否填错/被删除"
+    if code == 'model_missing':
+        return (f"看图模型名不对：{_host} 上没有「{_m}」这个模型。"
+                f"服务端原话：{raw}。\n"
+                "→ 到「⚙️ 设置 → 看图模型」点「测一下」，选一个能用的名字（换模型不用改 Secrets）。")
     if code == 'rate_limit':
-        return (f"服务商配额排队中（{VISION_MODEL or '视觉模型'} 这个模型当前太挤）— "
-                "程序已自动等 15 秒、30 秒各重试一次；仍失败就等 1 分钟再点「只重认这道」，"
-                "不用花钱。想更稳可以把 STUDY_VISION_MODEL 换成 Qwen/Qwen3-VL-30B-A3B-Instruct"
-                "（实测整页 18.8 秒，比 32B 快一半）")
+        return (f"「{_m}」当前没名额（{_host} 返回排队/限流，服务端原话：{raw}）。\n"
+                "→ 这不是网络问题，也不是你操作错了：这类共享配额的型号高峰期基本排不上队，"
+                "干等也没用。程序已自动重试过，仍然进不去 —— **换一个模型比等更有效**："
+                "⚙️ 设置 → 看图模型 → 测一下。")
     if code == 'timeout':
-        return "请求超时 — 服务商当前响应慢，隔一会儿点「只重认这道」重试即可"
+        return (f"请求超时（{_m} @ {_host}）— 服务商这会儿响应慢，隔一会儿点「只重认这道」重试即可")
     if '404' in msg:
-        return "接口地址或模型名不对 — 请检查 STUDY_VISION_BASE_URL 和 STUDY_VISION_MODEL"
-    return msg
+        return (f"接口地址或模型名不对（{_host} / {_m}）— "
+                "请检查 STUDY_VISION_BASE_URL 和 STUDY_VISION_MODEL")
+    return f"{raw}（通道 {_host} / 模型 {_m}）"
+
+
+def self_test(model: str = '', timeout: float = 25) -> dict:
+    """
+    「测一下看图」：用一张内置小图真打一次请求，把**真实结果**原样带回来。
+
+    为什么要有: 2026-10-28 那天，家长是"孩子拍完卷子、等 55 秒、只看到一句排队中"，
+    才知道看图坏了。这种信息不该等到使用时才暴露。现在点一下按钮，1~20 秒内拿到
+    OK/错在哪，且不影响错题本里的任何数据。
+
+    返回 {'ok', 'seconds', 'model', 'code', 'error', 'text', 'host'}
+    """
+    import io as _io
+    import time as _time
+    _m = (model or vision_model()).strip()
+    _host = vision_host()
+    stt = vision_status()
+    if not stt['enabled']:
+        return {'ok': False, 'seconds': 0.0, 'model': _m, 'code': 'disabled',
+                'error': f"看图没开启：{stt['reason']}", 'text': '', 'host': _host}
+    try:
+        from PIL import Image as _Image, ImageDraw as _ImageDraw
+        im = _Image.new('RGB', (320, 120), 'white')
+        d = _ImageDraw.Draw(im)
+        d.text((16, 20), '2 + 3 = 5', fill='black')      # 默认字体即可, 只验证"能不能看图"
+        d.text((16, 60), 'TEST 1 2 3', fill='black')
+        buf = _io.BytesIO()
+        im.save(buf, 'PNG')
+        img = buf.getvalue()
+    except Exception:
+        img = None
+    if not img:
+        return {'ok': False, 'seconds': 0.0, 'model': _m, 'code': 'other',
+                'error': '生成测试图失败（Pillow 有问题）', 'text': '', 'host': _host}
+    t0 = _time.time()
+    try:
+        from openai import OpenAI
+        import base64 as _b64
+        client = OpenAI(api_key=VISION_API_KEY, base_url=VISION_BASE_URL or None)
+        r = client.chat.completions.create(
+            model=_m,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "图里写的算式是什么？只把算式原样输出。"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64," + _b64.b64encode(img).decode()}},
+            ]}],
+            temperature=0.0, timeout=timeout,
+        )
+        txt = (r.choices[0].message.content or '').strip()
+        dt = round(_time.time() - t0, 1)
+        ok = '5' in txt
+        return {'ok': ok, 'seconds': dt, 'model': _m, 'code': 'ok' if ok else 'weird',
+                'error': '' if ok else f"连上了，但回的内容不对：{txt[:60]}",
+                'text': txt[:120], 'host': _host}
+    except Exception as e:
+        dt = round(_time.time() - t0, 1)
+        return {'ok': False, 'seconds': dt, 'model': _m, 'code': error_code(str(e)),
+                'error': _humanize_error(str(e), _m), 'text': '', 'host': _host}
 
 
 def _call_chat(system: str, user: str, json_mode: bool = False) -> dict:

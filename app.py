@@ -168,12 +168,12 @@ _SCAN_NEED = ('cropper_ready', 'ocr_boxes', 'lines_in_rect', 'normalize_rect',
               # 方向 + 去表格装饰（2026-10-28 真卷实测后加）
               'crop_from', 'guess_sideways', 'plainify',
               # 框太大提醒（2026-10-28 下午；名字清单漏过一次它，所以下面还有版本号兜底）
-              'box_ratio', 'module_ver_issue',
+              'box_ratio', 'module_ver_issue', 'edge_cut',
               # 失败后单题重认（漏了它 = 旧模块下点「只重认这道」再红一次）
               'ai_retry_one')
 
-_SCAN_WANT = 3      # 要求 scan.MODULE_VER >= 3（v3 才有 box_ratio）
-_LLM_WANT = 2       # 要求 llm.MODULE_VER >= 2（v2 才有 error_code / auto_verify / on_wait）
+_SCAN_WANT = 5      # 要求 scan.MODULE_VER >= 5（v5: edge_cut 提醒"框切到字"）
+_LLM_WANT = 3       # 要求 llm.MODULE_VER >= 3（v3: 模型可换可测 / 秒拒快收敛 / 校对不丢作答）
 
 
 def _scan_missing():
@@ -535,6 +535,20 @@ st.sidebar.markdown(f"**AI 老师**: {llm_status} ({llm_info['provider_display']
 _vs = llm.vision_status()
 if _vs['enabled']:
     st.sidebar.markdown(f"**AI 看图**: ✅ 已启用（{_vs.get('model', '')}）", unsafe_allow_html=True)
+    # 「测一下」：真打一次请求。2026-10-28 那天是孩子拍完卷子、等 55 秒、只看到一句
+    # "排队中"，才间接知道看图坏了 —— 这种事必须能主动查，不能等它自己暴露。
+    if st.sidebar.button('🔎 测一下看图', key='sb_selftest', use_container_width=True,
+                         help='真发一张小图（约 2 秒），当场告诉你这个模型现在能不能用'):
+        with st.sidebar:
+            with st.spinner('正在试…'):
+                st.session_state['vision_selftest'] = llm.self_test()
+    _st = st.session_state.get('vision_selftest')
+    if _st:
+        if _st.get('ok'):
+            st.sidebar.success(f"看图正常：{_st['seconds']} 秒 ｜ {_st.get('model')}")
+        else:
+            st.sidebar.error(f"看图不通（{_st.get('seconds')} 秒，{_st.get('code')}）："
+                             f"{_st.get('error')}")
 else:
     st.sidebar.markdown('**AI 看图**: ⚪ 未开启', unsafe_allow_html=True)
     st.sidebar.caption(f"不开也能用：本地识图已就绪，只是手写体、拍歪的题识别率低些。"
@@ -1229,15 +1243,16 @@ if page == '📷 拍照录入':
                 _rot_txt = {0: '原始方向', 90: '右转 90°', 180: '转了 180°',
                             270: '左转 90°'}.get(_rot, f'{_rot}°')
                 st.caption(f'当前：{_rot_txt}。照片横着放的先转正再画框 —— '
-                           '转正后本地草稿的文字顺序才对（AI 抄题不受方向影响，但草稿会乱）。')
+                           '横放时程序会自动把草稿按横向重排，但表格里的格子容易漏字；'
+                           '转正后草稿最准（AI 抄题本身不受方向影响）。')
 
             _rot_msg = st.session_state.pop('crop_rot_msg', None)
             if _rot_msg:
                 st.info(_rot_msg)
 
             st.markdown('**① 拖一个框圈住一道题的题干（可含孩子的解答）**')
-            st.caption('一个框只圈一道题。圈整页会慢 5 倍（实测整页 17~34 秒，单题 3.4 秒），'
-                       '还会把孩子的手写答案、老师批改一起抄进题面。')
+            st.caption('一个框只圈一道题。圈整页会慢（实测整页 17~34 秒，单题 11 秒），'
+                       '还会把孩子的手写答案、老师批改一起抄进题面；框的边别压在字上。')
             _raw_box = st_cropper(_sheet_img, return_type='box', box_color='#e8453c',
                                   realtime_update=True, key=f'cropper_{_seq}')
             _rect = scan.normalize_rect(_raw_box, _sheet_img.size)
@@ -1282,15 +1297,26 @@ if page == '📷 拍照录入':
                         _draft = ''
                         _boxes0 = st.session_state.get('sheet_boxes')
                         if _boxes0:
-                            _draft = scan.lines_in_rect(_boxes0, _rc).replace('\n', ' / ')
+                            _draft = scan.lines_in_rect(_boxes0, _rc)
                         _iw, _ih = _sheet_img.size
                         _ratio = scan.box_ratio(_rc, (_iw, _ih))
+                        _one = _draft.replace('\n', ' / ')
                         st.caption(f'左 {_rc[0]} 上 {_rc[1]} · 宽 {_rc[2]-_rc[0]} 高 {_rc[3]-_rc[1]}'
-                                   + (f'\n\n本地草稿：{_draft[:60]}' if _draft else ''))
+                                   + (f'\n\n本地草稿：{_one[:90]}' if _one else ''))
+                        if _draft:
+                            # 以前只显示前 60 字，用户完全看不出草稿是"漏了"还是"顺序乱了"。
+                            # 现在两样都能点开看（AI 挂了的时候，这就是唯一的信息来源）。
+                            with st.expander(f'📄 看完整草稿（{len(_one)} 字）'):
+                                st.text(_draft)
                         if _ratio > 0.55:
-                            st.caption(f'⚠️ 这个框占了整页 {_ratio*100:.0f}% —— 像是圈了整张卷子。'
-                                       '建议删掉，改成一道题一个框：更快，而且不会把孩子的手写答案'
-                                       '抄进题面。')
+                            st.caption(f'⚠️ 这个框占了整页 {_ratio*100:.0f}%，几乎是整张卷子。'
+                                       '建议一道题一个框：抄得更准、更快，也不会把孩子写在别处的答案'
+                                       '一起抄进题面。')
+                        _cut = scan.edge_cut(_boxes0 or [], _rc) if _boxes0 else []
+                        if _cut:
+                            st.caption(f'⚠️ 框的{"、".join(_cut)}边正好切在文字上 —— 被切掉的那半截'
+                                       '字 AI 也看不到（2026-10-28 真卷实测：题号和「（1）」就是这样'
+                                       '被裁掉的）。把框往那个方向拉宽一点，或者删掉重画。')
                     with _c:
                         if st.button('❌', key=f'del_crop_{_seq}_{_i}'):
                             st.session_state['crop_list'] = [
@@ -1355,9 +1381,9 @@ if page == '📷 拍照录入':
             # 吃掉，用户什么都看不到。实测设了 True 页面上却没有，就是栽在这。
             _sbx = st.session_state.get('sheet_boxes')
             if _sbx and scan.guess_sideways(_sbx):
-                st.warning('这张照片是横着放的（文字被认成了竖长条）。AI 抄题不受方向影响，'
-                           '但「本地草稿」的文字顺序会乱。建议点上面的「↺ 左转 90°」'
-                           '转正后重新画框，草稿才靠得住。')
+                st.warning('这张照片是横着放的（文字被认成了竖长条）。AI 抄题不受方向影响；'
+                           '「本地草稿」现在会自动按横向重排，但表格格子容易漏字。'
+                           '最稳的还是点上面的「↺ 左转 90°」转正后重新画框。')
 
             _items = st.session_state.get('crop_items') or []
             if _items:
@@ -1365,7 +1391,10 @@ if page == '📷 拍照录入':
                 if _stat:
                     if _stat.get('fail'):
                         st.warning(f"AI 复核完成：{_stat['ok']} 道成功、{_stat['fail']} 道没认出来"
-                                   f"（{_stat['seconds']} 秒）。没认出来的用的是本地草稿，请重点核对。")
+                                   f"（{_stat['seconds']} 秒）。没认出来的用的是本地草稿，请重点核对。"
+                                   "\n\n连一道都没成功时，多半是**看图模型这条路不通**（模型名不对／"
+                                   "这个型号今天没名额），不是你的操作问题 —— 点侧边栏「🔎 测一下看图」"
+                                   "当场就能确认，再决定要不要换个模型。")
                     else:
                         st.success(f"AI 复核完成：{_stat['ok']} 道全部认出来了（{_stat['seconds']} 秒）。")
                 for _it in _items:
@@ -2210,6 +2239,43 @@ elif page == '⚙️ 设置':
 
     重启后"AI 老师"状态会变成 ✓ 已启用
     """)
+
+    st.divider()
+    st.subheader('AI 看图（拍照录入）')
+    _vst = llm.vision_status()
+    st.caption(f"通道：{llm.vision_host()} ｜ 当前模型：**{_vst.get('model')}**")
+    if not _vst['enabled']:
+        st.warning(f"看图没开启：{_vst['reason']}")
+    st.markdown('**换模型不用改 Secrets** —— 选一个、点「测一下」，能用再保存。'
+                '模型名写错或这条路没名额，这里会当场告诉你（含服务端原话）。')
+    _cur_m = llm.vision_model()
+    _pick = st.text_input('模型名（留空 = 用 Secrets 里 STUDY_VISION_MODEL 的值）',
+                          value=_cur_m, key='vision_model_input',
+                          placeholder='例如 Qwen/Qwen3-VL-30B-A3B-Instruct')
+    _c1, _c2, _c3 = st.columns([1, 1, 2])
+    with _c1:
+        _do_test = st.button('🔎 测一下', key='vision_model_test', use_container_width=True)
+    with _c2:
+        _do_save = st.button('💾 保存', key='vision_model_save', use_container_width=True,
+                             type='primary')
+    if _do_test:
+        with st.spinner(f'用「{_pick or _cur_m}」真发一张小图…'):
+            _r = llm.self_test(_pick)
+        st.session_state['vision_set_test'] = _r
+    if _do_save:
+        llm.set_vision_model(_pick)
+        st.session_state.pop('vision_selftest', None)
+        st.success(f"已改为「{_pick or '（Secrets 默认）'}」，下次识别就用它。")
+        st.rerun()
+    _rt = st.session_state.get('vision_set_test')
+    if _rt:
+        if _rt.get('ok'):
+            st.success(f"✅ 能用：{_rt['model']}，{_rt['seconds']} 秒，返回「{_rt.get('text', '')[:40]}」")
+        else:
+            st.error(f"❌ 不能用（{_rt.get('seconds')} 秒，错误类型 {_rt.get('code')}）\n\n{_rt.get('error')}")
+    st.caption('实测参考（2026-10-28 同一张真卷、同一个框）：'
+               'Qwen3-VL-30B-A3B 单遍 11.4 秒 / 两遍 18.9 秒，题目和孩子的作答都抄对了；'
+               'Qwen3-VL-32B 高峰 33 秒起步，两遍那次 226 秒。')
 
     st.divider()
     st.subheader('家长 PIN')

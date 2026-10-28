@@ -220,6 +220,7 @@ print('== 15. 大图不做第二遍校对(省一半配额) ==')
 import llm
 check('单题裁剪块(896x376)要校对', llm.auto_verify(47 * 1024, 896 * 376) is True)
 check('整页图(1279x1706)只抄一遍', llm.auto_verify(226 * 1024, 1279 * 1706) is False)
+check('真卷单题大框(1023x767=78 万)也不校对', llm.auto_verify(0, 1023 * 767) is False)
 check('A4 300dpi 整页也只抄一遍', llm.auto_verify(600 * 1024, 2480 * 3508) is False)
 check('拿不到尺寸时按体积退化', llm.auto_verify(47 * 1024) is True)
 check('大体积但无尺寸也要保守跳过校对', llm.auto_verify(400 * 1024) is False)
@@ -236,6 +237,24 @@ check('配额文案提到会自动重试', '重试' in _h429, _h429)
 check('配额文案不再硬说"免费档"', '免费' not in _h429, _h429)
 check('超时文案说超时', '超时' in _h_to, _h_to)
 check('超时文案不冒充限流', '配额' not in _h_to and '限流' not in _h_to, _h_to)
+check('模型名不存在单独一类(不冒充限流)',
+      llm.error_code("Error code: 400 - {'code': 20012, 'message': 'Model does not exist.'}")
+      == 'model_missing')
+_h_bad = llm._humanize_error("Error code: 400 - {'code': 20012, 'message': 'Model does not exist.'}",
+                             'glm-4.6v-flash')
+check('模型名错时文案点名是哪个模型', 'glm-4.6v-flash' in _h_bad, _h_bad)
+check('模型名错时不冒充限流', '没名额' not in _h_bad, _h_bad)
+check('限流文案带上通道域名(好判断是哪家)', llm.vision_host() in _h429, _h429)
+
+print('== 16b. 校对不许吞掉"孩子的作答" ==')
+_draft = '23. 小王买进股票\n（1）星期三收盘时，每股是多少元？\n\n--- 孩子的作答 ---\n25-1.9=23.1元'
+_fixed = llm._keep_answer_block(_draft, '23. 小王买进股票\n（1）星期三收盘时，每股是多少元？')
+check('校对结果缺作答 → 补回来', '--- 孩子的作答 ---' in _fixed and '23.1' in _fixed, _fixed)
+check('作答在最后, 不插到题面中间', _fixed.strip().endswith('23.1元'), _fixed)
+_have_mark = 'X\n--- 孩子的作答 ---\nY'
+check('校对结果本来就有作答 → 不重复拼',
+      llm._keep_answer_block(_draft, _have_mark) == _have_mark)
+check('草稿本来没作答 → 原样返回', llm._keep_answer_block('只有题干', '修正后') == '修正后')
 
 print('== 17. 等配额时界面要能说话(不能 54 秒白屏) ==')
 _ow = []
@@ -256,7 +275,9 @@ class _FakeClient:
 
 _fc = _FakeClient()
 _old_waits = llm.VISION_WAITS
+_old_fast = llm.FAST_FAIL_WAITS
 llm.VISION_WAITS = (0, 0.01, 0.01)   # 别真等 15+30 秒
+llm.FAST_FAIL_WAITS = (0, 0.01)      # 秒拒后的"只再试一次"也别真等 5 秒
 try:
     try:
         llm._vision_call(_fc, on_wait=lambda a, s: _ow.append((a, s)), model='x')
@@ -265,9 +286,36 @@ try:
         _raised = True
 finally:
     llm.VISION_WAITS = _old_waits
-check('429 三次都败后抛出', _raised)
-check('重试了 3 次', _fc.calls == 3, _fc.calls)
-check('每次等待前都回调界面', _ow == [(1, 0.01), (2, 0.01)], _ow)
+    llm.FAST_FAIL_WAITS = _old_fast
+check('429 都败后抛出', _raised)
+check('秒拒(2.5 秒内)只再试 1 次, 不干等 45 秒', _fc.calls == 2, _fc.calls)
+check('秒拒时等待前仍回调界面', _ow == [(1, 0.01)], _ow)
+
+
+class _SlowClient(_FakeClient):
+    """慢 429: 服务端真让你排队, 这时候该等满 3 次"""
+
+    def create(self, **kw):
+        self.calls += 1
+        import time as _t
+        _t.sleep(0.09)
+        raise RuntimeError('Error code: 429 - rate limit exceeded')
+
+
+_sc = _SlowClient()
+_old_waits = llm.VISION_WAITS
+_old_rej = llm.REJECT_SECONDS
+llm.VISION_WAITS = (0, 0.01, 0.01)
+llm.REJECT_SECONDS = 0.05           # 0.09 秒 > 0.05 秒 → 算"真排队"
+try:
+    try:
+        llm._vision_call(_sc, model='x')
+    except Exception:
+        pass
+finally:
+    llm.VISION_WAITS = _old_waits
+    llm.REJECT_SECONDS = _old_rej
+check('慢 429 仍重试满 3 次', _sc.calls == 3, _sc.calls)
 
 _orig_read = scan.ai_read_one
 
@@ -380,6 +428,59 @@ _need = re.findall(r"'([a-zA-Z_]+)'", _need_m.group(1)) if _need_m else []
 check('清单里 box_ratio 没再漏', 'box_ratio' in _need)
 _miss = [n for n in _need if not hasattr(scan, n)]
 check('清单里每个名字 scan 都真有', not _miss, _miss)
+
+print('== 21. 横放照片: 草稿顺序必须重排(2026-10-28 二次翻车) ==')
+
+
+def _tall(x, text):
+    """模拟横放照片里的一根"竖长条": 宽 50、高 420(实测 59x437 那种)"""
+    return {'text': text, 'conf': 0.9, 'x0': x, 'x1': x + 50, 'y0': 100, 'y1': 520}
+
+
+# 页首在右边(x 大), 页尾在左边 —— 真实横放照片就是这样, 竖条的 y 几乎一样, 按 y 排等于没排
+_sideways = [
+    _tall(900, '23.小王上周五买进某种股票 1000 股，每股 25 元'),
+    _tall(700, '每股涨跌 +2 +1.7 -1.9 -2.3 +0.7'),
+    _tall(500, '（1）星期三收盘时，每股是多少元？'),
+    _tall(300, '（2）本周内最高价是每股多少元？最低价是每股多少元？'),
+    _tall(100, '（3）若小王以本周五的收盘价将股票全部卖出，你认为他会获利吗？'),
+]
+check('竖条确实被判成"横放"', scan.guess_sideways(_sideways))
+_txt = scan.lines_in_rect(_sideways, (0, 0, 1200, 700))
+check('横放时草稿从页首开始(题号打头)', _txt.startswith('23.'), _txt[:60])
+check('横放时草稿不再整段挤成一行', len(_txt.splitlines()) >= 4, len(_txt.splitlines()))
+check('横放时"（1）"排在"（3）"前面',
+      _txt.index('（1）') < _txt.index('（3）'), _txt[:120])
+
+# 反方向(页首在左边)也得认出来 —— 不能只会一个方向
+_sideways2 = [_tall(1200 - b['x0'], b['text']) for b in _sideways]
+_txt2 = scan.lines_in_rect(_sideways2, (0, 0, 1400, 700))
+check('反方向也以题号打头', _txt2.startswith('23.'), _txt2[:60])
+
+# 正常竖排(横向文字框)不能被这套逻辑带歪
+_upright = [{'text': '23.小王买进股票', 'conf': 1.0, 'x0': 40, 'x1': 700, 'y0': 30, 'y1': 80},
+            {'text': '（1）星期三收盘时，每股是多少元？', 'conf': 1.0,
+             'x0': 40, 'x1': 700, 'y0': 120, 'y1': 170}]
+check('正常竖排不受影响', scan.lines_in_rect(_upright, (0, 0, 800, 400)).startswith('23.'))
+check('横向行不会被误判成横放', scan.guess_sideways(_upright) is False)
+check('带表格的页(竖条过半但混有横条)仍算横放',
+      scan.guess_sideways(_sideways + [{'text': '+2', 'conf': 1.0, 'x0': 800, 'x1': 860,
+                                        'y0': 600, 'y1': 620}] * 2))
+
+print('== 22. 框切到字要提醒(2026-10-28 真卷: 题号被裁掉一半) ==')
+_line = {'text': '23.小王上周五买进某种股票 1000 股', 'conf': 1.0,
+         'x0': 148, 'x1': 1582, 'y0': 159, 'y1': 226}
+check('框左边缘压在这行字中间 → 报"左"',
+      '左' in scan.edge_cut([_line], (341, 140, 1650, 400)), scan.edge_cut([_line], (341, 140, 1650, 400)))
+check('框能把整行包住 → 不报',
+      scan.edge_cut([_line], (100, 100, 1650, 300)) == [], scan.edge_cut([_line], (100, 100, 1650, 300)))
+check('框在字上方(不相交) → 不报',
+      scan.edge_cut([_line], (100, 300, 1650, 500)) == [])
+check('框上边缘压在这行字中间 → 报"上"',
+      scan.edge_cut([_line], (100, 200, 1650, 600)) == ['上'], scan.edge_cut([_line], (100, 200, 1650, 600)))
+check('空输入不炸', scan.edge_cut([], (0, 0, 10, 10)) == [] and scan.edge_cut([_line], None) == [])
+check('整页框不误报', scan.edge_cut([_line], (0, 0, 1706, 1279)) == [],
+      scan.edge_cut([_line], (0, 0, 1706, 1279)))
 
 print(f'\n结果: {PASS} 通过 / {FAIL} 失败')
 raise SystemExit(1 if FAIL else 0)
