@@ -160,28 +160,60 @@ if _MISSING_API:
     )
     st.stop()
 
-# ---- scan 模块自检（同上。画框多选用它；它缺函数时只跳过这一块，不拖垮整页）----
+# ---- scan / llm 模块自检（同上。画框多选用 scan、AI 看图用 llm；
+#      它们缺东西时只跳过画框这一块，不拖垮整页）----
 _SCAN_NEED = ('cropper_ready', 'ocr_boxes', 'lines_in_rect', 'normalize_rect',
               'crop_image', 'save_crop', 'run_ai_batch', 'final_text', 'save_batch',
               'MAX_CROPS',
               # 方向 + 去表格装饰（2026-10-28 真卷实测后加）
-              'crop_from', 'guess_sideways', 'plainify')
+              'crop_from', 'guess_sideways', 'plainify',
+              # 框太大提醒（2026-10-28 下午；名字清单漏过一次它，所以下面还有版本号兜底）
+              'box_ratio', 'module_ver_issue')
+
+_SCAN_WANT = 3      # 要求 scan.MODULE_VER >= 3（v3 才有 box_ratio）
+_LLM_WANT = 2       # 要求 llm.MODULE_VER >= 2（v2 才有 error_code / auto_verify / on_wait）
 
 
 def _scan_missing():
     return [n for n in _SCAN_NEED if not hasattr(scan, n)]
 
 
+def _mod_ver_issue():
+    """内存里的模块版本够不够。名字清单会漏（实测漏过 box_ratio），版本号是兜底层。"""
+    fn = getattr(scan, 'module_ver_issue', None)
+    if fn is None:
+        return [('scan', int(getattr(scan, 'MODULE_VER', 0) or 0), _SCAN_WANT)]
+    try:
+        return fn({'scan': scan, 'llm': llm},
+                  {'scan': _SCAN_WANT, 'llm': _LLM_WANT})
+    except Exception:
+        return []
+
+
 _MISSING_SCAN = _scan_missing()
-if _MISSING_SCAN:
+_STALE_MODS = _mod_ver_issue()
+_MOD_RELOAD_ERR = ''
+if _MISSING_SCAN or _STALE_MODS:
+    # 先自己修：进程里的模块对象是旧的，但磁盘上的 .py 通常已经是新的 → reload 就地更新。
+    # 顺序必须是先 llm 再 scan：scan 模块体里有 `import llm`，反了会重新绑回旧 llm。
     try:
         import importlib
+        importlib.reload(llm)
         importlib.reload(scan)
-        _MISSING_SCAN = _scan_missing()
     except Exception as _e:
-        _MISSING_SCAN = _MISSING_SCAN or ['reload 失败：%s' % _e]
+        _MOD_RELOAD_ERR = '%s: %s' % (type(_e).__name__, str(_e)[:80])
+    _MISSING_SCAN = _scan_missing()
+    _STALE_MODS = _mod_ver_issue()
 
-HAS_SHEET_CROP = not _MISSING_SCAN
+HAS_SHEET_CROP = not _MISSING_SCAN and not _STALE_MODS
+
+# 旧模块的人话说明（别只说"出错了"——用户会以为是自己操作错了）
+_MOD_ISSUE_TEXT = ''
+if _STALE_MODS:
+    _MOD_ISSUE_TEXT = '内存里跑的还是旧模块：' + '、'.join(
+        f'{_n} v{_h}（这里要 v{_d}）' for _n, _h, _d in _STALE_MODS)
+elif _MISSING_SCAN:
+    _MOD_ISSUE_TEXT = '内存里跑的还是旧模块：scan 缺 ' + '、'.join(_MISSING_SCAN[:3])
 
 # 每日测试模块的表(试卷/题目/掌握度/AI 题库)
 quiz.init_quiz_db()
@@ -1144,11 +1176,15 @@ if page == '📷 拍照录入':
     if not _sheet_rel:
         st.info('先在「1. 上传题目照片」传一张卷子，然后回到这里画框。')
     else:
-        _cok, _cwhy = scan.cropper_ready()
+        # 模块太旧时连 cropper_ready 都可能没有，先判断再调，别在自检里再抛一次异常
+        _cok, _cwhy = (False, '模块太旧') if not hasattr(scan, 'cropper_ready') else scan.cropper_ready()
         if not HAS_SHEET_CROP:
-            st.warning('后台还在跑旧版的 scan 模块（缺 ' + '、'.join(_MISSING_SCAN[:3])
-                       + '），画框这块先跳过，其它功能不受影响。'
-                       '线上点右下角 **Manage app → Reboot app**，本地重开 streamlit 即可。')
+            st.warning(_MOD_ISSUE_TEXT + '，所以画框这块先跳过（其它功能不受影响）。\n\n'
+                       '**不是你的操作问题** —— 代码本身是对的，是运行中的进程还在用老模块。'
+                       '我试过自动重载，没成功。\n\n'
+                       '- 线上：右下角 **Manage app → Reboot app**，等 30 秒刷新。\n'
+                       '- 本地：关掉跑 streamlit 的窗口，重新 `streamlit run app.py`。'
+                       + (f'\n\n（重载失败原因：{_MOD_RELOAD_ERR}）' if _MOD_RELOAD_ERR else ''))
         elif not _cok:
             st.warning(f'画框组件没装上（{_cwhy}）—— 现在只能用上面「一次一道」的方式录入。')
         else:

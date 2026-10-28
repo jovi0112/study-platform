@@ -335,5 +335,51 @@ check('尺寸为 0 不除零', scan.box_ratio((0, 0, 10, 10), (0, 0)) == 0.0)
 check('脏数据返回 0', scan.box_ratio(('a', 'b', 'c', 'd'), _sz) == 0.0)
 check('超出图片也夹在 1.0 以内', scan.box_ratio((-99, -99, 9999, 9999), _sz) <= 1.0)
 
+print('== 20. 模块版本自检(防"新界面配旧模块") ==')
+import re
+import types
+import llm
+
+_fresh = {'scan': types.SimpleNamespace(MODULE_VER=3),
+          'llm': types.SimpleNamespace(MODULE_VER=2)}
+check('都是新模块 → 没问题', scan.module_ver_issue(_fresh, {'scan': 3, 'llm': 2}) == [])
+
+_old = {'scan': types.SimpleNamespace(MODULE_VER=2),
+        'llm': types.SimpleNamespace(MODULE_VER=2)}
+check('scan 旧一版 → 报出来', scan.module_ver_issue(_old, {'scan': 3, 'llm': 2}) == [('scan', 2, 3)])
+
+_nover = {'scan': types.SimpleNamespace(), 'llm': types.SimpleNamespace()}
+check('连 MODULE_VER 都没有 → 当 v0 处理',
+      scan.module_ver_issue(_nover, {'scan': 3}) == [('scan', 0, 3)])
+
+check('空清单 → 不报', scan.module_ver_issue({}, {}) == [])
+check('模块缺失 → 当 v0 处理', scan.module_ver_issue({}, {'scan': 3}) == [('scan', 0, 3)])
+check('脏 MODULE_VER 不炸',
+      scan.module_ver_issue({'scan': types.SimpleNamespace(MODULE_VER='x')}, {'scan': 1})
+      == [('scan', 0, 1)])
+check('脏要求值跳过',
+      scan.module_ver_issue({'scan': _fresh['scan']}, {'scan': 'abc'}) == [])
+
+# ---- app.py 里写死的版本要求, 必须和模块里的 MODULE_VER 同步 ----
+# 这是防"加了函数、bump 了模块、却忘了改 app.py"——那样旧模块又能混过去, 又变成一片红字。
+_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app.py'),
+            encoding='utf-8').read()
+_m = re.search(r'^_SCAN_WANT\s*=\s*(\d+)', _src, re.M)
+check('app.py 里有 _SCAN_WANT', _m is not None)
+check(f'app.py 要求 scan v{_m.group(1) if _m else "?"} = 模块实际 v{scan.MODULE_VER}',
+      _m is not None and int(_m.group(1)) == scan.MODULE_VER)
+_m2 = re.search(r'^_LLM_WANT\s*=\s*(\d+)', _src, re.M)
+check('app.py 里有 _LLM_WANT', _m2 is not None)
+check(f'app.py 要求 llm v{_m2.group(1) if _m2 else "?"} = 模块实际 v{llm.MODULE_VER}',
+      _m2 is not None and int(_m2.group(1)) == llm.MODULE_VER)
+
+# 名字清单两头都对: 里面每个名字 scan 都得有(防写错), 且 box_ratio 必须在(这次漏的就是它)
+_need_m = re.search(r'^_SCAN_NEED\s*=\s*\((.*?)\)\s*$', _src, re.M | re.S)
+check('app.py 里有 _SCAN_NEED', _need_m is not None)
+_need = re.findall(r"'([a-zA-Z_]+)'", _need_m.group(1)) if _need_m else []
+check('清单里 box_ratio 没再漏', 'box_ratio' in _need)
+_miss = [n for n in _need if not hasattr(scan, n)]
+check('清单里每个名字 scan 都真有', not _miss, _miss)
+
 print(f'\n结果: {PASS} 通过 / {FAIL} 失败')
 raise SystemExit(1 if FAIL else 0)

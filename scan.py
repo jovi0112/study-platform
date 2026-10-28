@@ -39,10 +39,39 @@ from PIL import Image, ImageOps
 import ocr
 import llm
 
-MODULE_VER = 2      # v2: 加旋转 / crop_from / guess_sideways / plainify (2026-10-28 真卷)
+MODULE_VER = 3      # v3: 加 box_ratio(框太大会不会圈了整页) 2026-10-28 下午
+#                      v2: 加旋转 / crop_from / guess_sideways / plainify (2026-10-28 真卷)
 
 # 一次最多框多少道(防止误操作框出几百个)
 MAX_CROPS = 20
+
+
+def module_ver_issue(mods: dict, want: dict) -> list:
+    """
+    哪些模块的 MODULE_VER 低于界面要求的版本. 返回 [(名字, 实际, 要求), ...]
+
+    为什么需要这个(2026-10-28 线上实测踩到):
+    Streamlit 每次交互只重新执行 app.py, **已经 import 过的模块不会重读磁盘**。
+    于是会出现"app.py 是新的、scan 是旧的"这种组合 —— 线上就是这样:
+    新 app.py 调 scan.box_ratio, 内存里的旧模块没这个函数, 整页抛 AttributeError,
+    用户只看到一片红字, 完全不知道是"旧进程"而不是自己操作错了。
+    属性清单(_SCAN_NEED)能兜住大部分, 但只要加函数时忘了往清单里补就漏 ——
+    这次漏的正是 box_ratio。版本号是兜底层: 加函数就 bump, 界面写死要求值。
+    """
+    out = []
+    for name, need in (want or {}).items():
+        mod = (mods or {}).get(name)
+        try:
+            have = int(getattr(mod, 'MODULE_VER', 0) or 0)
+        except Exception:
+            have = 0
+        try:
+            need = int(need)
+        except Exception:
+            continue
+        if have < need:
+            out.append((name, have, need))
+    return out
 
 
 # ============== 组件可用性 ==============

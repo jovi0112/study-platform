@@ -9,6 +9,10 @@ import os
 import json
 from typing import Optional
 
+# 界面(app.py)会拿这个值判断进程里是不是旧模块 —— 改了对外接口就 bump, 并在 app.py 的
+# _LLM_WANT 里同步. 背景见 scan.module_ver_issue 的注释(线上"新界面配旧模块"那次事故).
+MODULE_VER = 2      # v2: 加 error_code / auto_verify / _vision_call(on_wait) 2026-10-28
+
 
 def _read_secret(key: str, default: str = '') -> str:
     """
