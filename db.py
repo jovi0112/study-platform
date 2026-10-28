@@ -111,6 +111,7 @@ def init_db():
         _ensure_column(conn, 'mistakes', 'passage', 'TEXT')       # 阅读题原文(没课本也做得了)
         _ensure_column(conn, 'mistakes', 'miss_reason', 'TEXT')   # 未做原因: timeout / blank / ''
         _ensure_column(conn, 'mistakes', 'uid', 'TEXT')
+        _ensure_column(conn, 'mistakes', 'parent_photo', 'TEXT')  # 裁剪图记原图, 方便换框重选
         # 后补的列只能在 ALTER 之后建索引 —— 写进 SCHEMA 会在老库上直接把 init_db 打崩
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mistakes_miss ON mistakes(miss_reason)")
         conn.executescript("""
@@ -146,7 +147,8 @@ def add_mistake(subject, question, **kwargs):
                                      'explanation', 'wrong_reason',
                                      'knowledge_id', 'image_path', 'source',
                                      'diagram_json', 'qtype', 'options_json',
-                                     'points_json', 'passage', 'miss_reason', 'uid'):
+                                     'points_json', 'passage', 'miss_reason', 'uid',
+                                     'parent_photo'):
             fields.append(k)
             placeholders.append('?')
             values.append(v)

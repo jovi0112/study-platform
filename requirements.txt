@@ -5,3 +5,5 @@ requests>=2.31
 rapidocr-onnxruntime>=1.3
 # LLM 接入(DeepSeek / 通义 / 智谱 / OpenAI 兼容接口)
 openai>=1.0
+# 整张卷子画框多选(一道题一个框). 缺了会明确提示"框选未就绪", 不会静默失效
+streamlit-cropper>=0.3.1

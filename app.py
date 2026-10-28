@@ -21,6 +21,7 @@ import web_search
 import backup
 import quiz
 import diagram
+import scan
 # ============== 路径 ==============
 APP_DIR = os.path.dirname(__file__)
 UPLOAD_DIR = os.path.join(APP_DIR, 'uploads')
@@ -972,7 +973,11 @@ if page == '📷 拍照录入':
 
         # AI 看图开着就自动跑, 孩子不用再多点一步(想省流量可勾掉)
         if llm.is_vision_enabled():
-            st.checkbox('上传后自动用 AI 看图', value=True, key='ai_auto')
+            # 默认关: 整张卷子跑一次 AI 要 1~2 分钟, 而这期间整页都卡着不出内容
+            # (实测 105 秒)。整卷场景改用下面「画框多选」逐题识别, 更快也更准。
+            st.checkbox('上传后自动用 AI 看图（一次一道题时才需要）', value=False, key='ai_auto',
+                        help='整张卷子别开这个 —— 会等 1~2 分钟且整页不动。'
+                             '卷子用下面「画框多选」逐题识别。')
 
         if up:
             # 同一张图只在首次上传时识别一次(换图才重跑), 避免每次交互都重复保存+识别
@@ -1101,6 +1106,188 @@ if page == '📷 拍照录入':
                 st.success(f'已保存! ID = {kid}. 到"错题本"标签查看.')
                 backup.push_after_change()   # 云端是临时存储, 存一条就往备份送一条
                 st.balloons()
+
+    # ====== 整张卷子: 画多个框, 一次录好几道 ======
+    st.divider()
+    st.subheader('🖼️ 一整张卷子？画框多选，一次录好几道')
+    st.caption('卷子上错了好几道时用这里：在照片上拖一个框 = 一道题，接着框下一道，'
+               '全部框完点「识别」，最后一起存进错题本（一题一条，各自带裁剪图）。')
+
+    _saved_msg = st.session_state.pop('crop_saved_msg', None)
+    if _saved_msg:
+        st.success(_saved_msg)
+
+    _sheet_rel = st.session_state.get('img_rel')
+    if not _sheet_rel:
+        st.info('先在「1. 上传题目照片」传一张卷子，然后回到这里画框。')
+    else:
+        _cok, _cwhy = scan.cropper_ready()
+        if not _cok:
+            st.warning(f'画框组件没装上（{_cwhy}）—— 现在只能用上面「一次一道」的方式录入。')
+        else:
+            from streamlit_cropper import st_cropper
+
+            _sheet_abs = relative_to_abs(_sheet_rel)
+            try:
+                _sheet_img = ImageOps.exif_transpose(Image.open(_sheet_abs))
+            except Exception:
+                _sheet_img = Image.open(_sheet_abs)
+
+            _seq = int(st.session_state.get('crop_seq') or 0)
+            st.markdown('**① 拖一个框圈住一道题的题干（可含孩子的解答）**')
+            _raw_box = st_cropper(_sheet_img, return_type='box', box_color='#e8453c',
+                                  realtime_update=True, key=f'cropper_{_seq}')
+            _rect = scan.normalize_rect(_raw_box, _sheet_img.size)
+            if _rect:
+                st.caption(f'当前框：左 {_rect[0]} · 上 {_rect[1]} · 宽 {_rect[2]-_rect[0]} · 高 {_rect[3]-_rect[1]} 像素')
+
+            _cl, _cr = st.columns(2)
+            with _cl:
+                if st.button('➕ 加为下一题', use_container_width=True, type='primary',
+                             key=f'add_crop_{_seq}'):
+                    _lst0 = st.session_state.setdefault('crop_list', [])
+                    if not _rect:
+                        st.error('框太小或没框上，重新拖一个再点。')
+                    elif len(_lst0) >= scan.MAX_CROPS:
+                        st.error(f'一次最多框 {scan.MAX_CROPS} 道，够用了；先识别存掉一批再来。')
+                    else:
+                        _lst0.append(_rect)
+                        # 换 key 让组件重建：框回到默认位置，接着画下一道
+                        st.session_state['crop_seq'] = _seq + 1
+                        st.session_state.pop('crop_items', None)
+                        st.rerun()
+            with _cr:
+                if st.button('🗑 清空所有框', use_container_width=True, key=f'clr_crop_{_seq}'):
+                    st.session_state['crop_list'] = []
+                    st.session_state['crop_seq'] = _seq + 1
+                    st.session_state.pop('crop_items', None)
+                    st.session_state.pop('sheet_boxes', None)
+                    st.rerun()
+
+            _lst = st.session_state.get('crop_list') or []
+            if _lst:
+                st.markdown(f'**② 已框 {len(_lst)} 道** —— 框错了点 ❌ 删掉重框')
+                for _i, _rc in enumerate(_lst, 1):
+                    _a, _b, _c = st.columns([1, 5, 1])
+                    with _a:
+                        try:
+                            st.image(scan.crop_image(_sheet_abs, _rc), width=90,
+                                     caption=f'第 {_i} 题')
+                        except Exception:
+                            st.caption(f'第 {_i} 题(预览失败)')
+                    with _b:
+                        _draft = ''
+                        _boxes0 = st.session_state.get('sheet_boxes')
+                        if _boxes0:
+                            _draft = scan.lines_in_rect(_boxes0, _rc).replace('\n', ' / ')
+                        st.caption(f'左 {_rc[0]} 上 {_rc[1]} · 宽 {_rc[2]-_rc[0]} 高 {_rc[3]-_rc[1]}'
+                                   + (f'\n\n本地草稿：{_draft[:60]}' if _draft else ''))
+                    with _c:
+                        if st.button('❌', key=f'del_crop_{_seq}_{_i}'):
+                            st.session_state['crop_list'] = [
+                                r for j, r in enumerate(_lst, 1) if j != _i]
+                            st.session_state.pop('crop_items', None)
+                            st.rerun()
+
+                _sc1, _sc2, _sc3 = st.columns([1.2, 1, 2])
+                with _sc1:
+                    _c_subject = st.selectbox('学科', SUBJECTS, index=0, key='crop_subj')
+                with _sc2:
+                    _c_grade = st.text_input('年级', placeholder='如 初一', key='crop_grade')
+                with _sc3:
+                    _use_ai = st.checkbox('用 AI 逐题复核（更准；每道 5~15 秒，图大或限流会到 1 分钟）',
+                                          value=True, key='crop_use_ai') \
+                        if llm.vision_status()['enabled'] else False
+                    if not llm.vision_status()['enabled']:
+                        st.caption(f"AI 看图未开启({llm.vision_status()['reason']})，这次用本地草稿。")
+
+                st.markdown('**③ 识别这几道**')
+                if st.button(f'🔍 识别这 {len(_lst)} 道题', use_container_width=True,
+                             type='primary', key=f'run_crop_{_seq}'):
+                    if st.session_state.get('sheet_boxes') is None:
+                        with st.spinner('先给整张卷子做一次文字定位（约 3 秒）…'):
+                            st.session_state['sheet_boxes'] = scan.ocr_boxes(_sheet_abs)
+                    _bx = st.session_state.get('sheet_boxes') or []
+                    _items = []
+                    for _i, _rc in enumerate(_lst, 1):
+                        _rel, _absp = scan.save_crop(scan.crop_image(_sheet_abs, _rc),
+                                                     _sheet_rel, _i, UPLOAD_DIR)
+                        _items.append({
+                            'idx': _i, 'rect': _rc, 'crop_rel': _rel, 'crop_abs': _absp,
+                            'draft_text': scan.lines_in_rect(_bx, _rc),
+                            'ai_text': '', 'ai_error': None,
+                        })
+                    if _use_ai:
+                        # 一张裁剪图实测要 5~15 秒(两遍校对), 必须给进度条, 否则用户以为卡死
+                        _prog = st.progress(0.0, text=f'AI 逐题看图… 0/{len(_items)} 道')
+                        _stat = scan.run_ai_batch(
+                            _items, subject=_c_subject, workers=3,
+                            on_progress=lambda _d, _n: _prog.progress(
+                                _d / max(1, _n), text=f'AI 逐题看图… {_d}/{_n} 道'))
+                        _prog.empty()
+                        st.session_state['crop_ai_stat'] = _stat
+                    st.session_state['crop_items'] = _items
+                    for _it in _items:
+                        st.session_state.pop(f"crop_text_{_it['idx']}", None)
+                    st.rerun()
+
+            _items = st.session_state.get('crop_items') or []
+            if _items:
+                _stat = st.session_state.get('crop_ai_stat') or {}
+                if _stat:
+                    if _stat.get('fail'):
+                        st.warning(f"AI 复核完成：{_stat['ok']} 道成功、{_stat['fail']} 道没认出来"
+                                   f"（{_stat['seconds']} 秒）。没认出来的用的是本地草稿，请重点核对。")
+                    else:
+                        st.success(f"AI 复核完成：{_stat['ok']} 道全部认出来了（{_stat['seconds']} 秒）。")
+                for _it in _items:
+                    with st.container(border=True):
+                        _p1, _p2 = st.columns([1, 3])
+                        with _p1:
+                            try:
+                                st.image(_it['crop_abs'], caption=f"第 {_it['idx']} 题",
+                                         use_container_width=True)
+                            except Exception:
+                                st.caption('预览失败')
+                        with _p2:
+                            if _it.get('ai_text'):
+                                st.caption('✅ 题面来自 AI 看图（已校对两遍）')
+                            elif _it.get('ai_error'):
+                                st.caption(f"⚠️ AI 没认出来（{_it['ai_error']}），下面是本地草稿，务必核对")
+                            else:
+                                st.caption('📝 本地草稿（没开 AI 复核）')
+                            _default = scan.final_text(_it)
+                            st.text_area(f'第 {_it["idx"]} 题题面（可直接改）', value=_default,
+                                         height=110, key=f"crop_text_{_it['idx']}")
+
+                if st.button(f'✅ 全部存入错题本（{len(_items)} 条）', type='primary',
+                             use_container_width=True, key='save_crop_batch'):
+                    _done = []
+                    for _it in _items:
+                        _txt = (st.session_state.get(f"crop_text_{_it['idx']}") or '').strip()
+                        _it2 = dict(_it)
+                        _it2['ai_text'] = _txt      # 以用户改过的为准
+                        _it2['draft_text'] = _txt
+                        _done.append(_it2)
+                    _res = scan.save_batch(_done, subject=_c_subject, upload_dir=UPLOAD_DIR,
+                                           parent_photo=_sheet_rel)
+                    if _res['ids']:
+                        # 先存一条提示再 rerun —— 直接把 success 画在当前轮, rerun 会把它冲掉,
+                        # 用户看到的是"点完什么都没发生"(这个坑实测踩到了)
+                        st.session_state['crop_saved_msg'] = (
+                            f"已存入 {len(_res['ids'])} 条错题"
+                            + (f"，跳过 {_res['skipped']} 条（题面是空的）" if _res['skipped'] else '')
+                            + '。到「错题本」标签查看。')
+                        backup.push_after_change()
+                        st.session_state['crop_list'] = []
+                        st.session_state['crop_seq'] = _seq + 1
+                        st.session_state.pop('crop_items', None)
+                        st.session_state.pop('crop_ai_stat', None)
+                        st.session_state.pop('sheet_boxes', None)
+                        st.balloons()
+                        st.rerun()
+                    else:
+                        st.error('一条都没存上：题面全是空的，检查一下上面每道题的题面。')
 
 
 # ============== 页面 2: 错题本 ==============

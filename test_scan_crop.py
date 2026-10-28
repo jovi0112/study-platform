@@ -1,0 +1,165 @@
+"""
+多题框选(整张卷子 -> 一题一条)的回归测试。
+
+覆盖: 坐标清洗 / 同一行内左右排序 / 框内取行 / 裁剪尺寸 / 批量入库 / AI 并发降级。
+不联网(AI 那部分用替身), 不碰真实数据库(指向临时库)。
+
+用法: python test_scan_crop.py
+"""
+import os
+import tempfile
+
+# ---- 先换库, 再 import db/scan, 避免污染真实数据 ----
+tmpdir = tempfile.mkdtemp()
+import db
+
+db.DB_PATH = os.path.join(tmpdir, 'test_scan.db')
+
+import scan
+
+PASS, FAIL = 0, 0
+
+
+def check(name, cond, extra=''):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f'  ✓ {name}')
+    else:
+        FAIL += 1
+        print(f'  ✗ {name}  {extra}')
+
+
+print('== 1. normalize_rect 坐标清洗 ==')
+img_size = (1000, 800)
+r = scan.normalize_rect({'left': 10, 'top': 20, 'width': 300, 'height': 100}, img_size)
+check('正常框原样保留', r == (10, 20, 310, 120), r)
+
+r = scan.normalize_rect({'left': 10.6, 'top': 20.4, 'width': 99.6, 'height': 50.2}, img_size)
+check('小数四舍五入', r == (11, 20, 110, 71), r)
+
+r = scan.normalize_rect({'left': -50, 'top': -30, 'width': 200, 'height': 100}, img_size)
+check('负数夹到 0', r == (0, 0, 150, 70), r)
+
+r = scan.normalize_rect({'left': 900, 'top': 700, 'width': 500, 'height': 500}, img_size)
+check('越界夹到图片边界', r == (900, 700, 1000, 800), r)
+
+check('空框返回 None', scan.normalize_rect(None, img_size) is None)
+check('太小的框丢弃', scan.normalize_rect({'left': 5, 'top': 5, 'width': 3, 'height': 2},
+                                            img_size) is None)
+check('脏数据返回 None', scan.normalize_rect({'left': 'abc'}, img_size) is None)
+
+print('== 2. 同一行内按 x 从左到右(选项 A B C D 不会乱序) ==')
+rows = [
+    {'text': 'A. -2a²b', 'conf': .9, 'x0': 120, 'x1': 240, 'y0': 300, 'y1': 330},
+    {'text': 'C. -2a²b²', 'conf': .9, 'x0': 520, 'x1': 660, 'y0': 304, 'y1': 334},
+    {'text': 'B. 3ab²', 'conf': .9, 'x0': 330, 'x1': 430, 'y0': 302, 'y1': 332},
+    {'text': 'D. 4ab', 'conf': .9, 'x0': 730, 'x1': 830, 'y0': 299, 'y1': 329},
+]
+grouped = scan._group_rows(sorted(rows, key=lambda x: x['y0']))
+check('聚成 1 行', len(grouped) == 1, f'实际 {len(grouped)} 行')
+order = [b['text'][0] for b in grouped[0]]
+check('顺序 A B C D', order == ['A', 'B', 'C', 'D'], order)
+
+lines = scan.lines_in_rect(sorted(rows, key=lambda x: x['y0']), (100, 290, 900, 340))
+check('框内文本按 A B C D 拼接', lines.startswith('A. -2a²b B. 3ab²'), lines)
+
+print('== 3. 框内取行 ==')
+boxes = [
+    {'text': '第一题题干', 'conf': .9, 'x0': 80, 'x1': 400, 'y0': 100, 'y1': 140},
+    {'text': '第二题题干', 'conf': .9, 'x0': 80, 'x1': 400, 'y0': 300, 'y1': 340},
+]
+check('只取框内的行', scan.lines_in_rect(boxes, (50, 80, 900, 200)) == '第一题题干')
+check('框在空白处返回空串', scan.lines_in_rect(boxes, (50, 600, 900, 700)) == '')
+check('空输入不炸', scan.lines_in_rect([], (0, 0, 10, 10)) == '')
+
+print('== 4. 真实图片: OCR 坐标 + 裁剪 ==')
+sheet = 'mock_sheet.png'
+if os.path.exists(sheet):
+    from PIL import Image
+    w, h = Image.open(sheet).size
+    bx = scan.ocr_boxes(sheet)
+    check('整卷 OCR 拿到带坐标的行', len(bx) >= 10, f'{len(bx)} 行')
+    check('坐标落在图片范围内',
+          all(0 <= b['x0'] <= w and 0 <= b['y1'] <= h for b in bx))
+    rect3 = (70, 502, 1170, 634)          # 第3题: 解方程 2x-5=9
+    txt3 = scan.lines_in_rect(bx, rect3)
+    check('第3题框内文本含"解方程"', '解方程' in txt3.replace(' ', ''), txt3)
+    crop = scan.crop_image(sheet, rect3)
+    check('裁剪尺寸与框一致', crop.size == (1100, 132), crop.size)
+    # 框外的题不该混进来
+    check('第3题框内不含第4题内容', '化简' not in txt3, txt3)
+else:
+    print('  ! 缺少 mock_sheet.png, 跳过真实图片用例')
+
+print('== 5. save_crop 落盘 ==')
+from PIL import Image as _Image
+tmpimg = _Image.new('RGB', (120, 60), 'white')
+rel, absp = scan.save_crop(tmpimg, 'sheet.jpg', 3, os.path.join(tmpdir, 'uploads'))
+check('返回相对名', rel.startswith('crop3_'), rel)
+check('文件真的存在', os.path.exists(absp))
+check('图片可读且尺寸对', _Image.open(absp).size == (120, 60))
+
+print('== 6. final_text 取哪一版 ==')
+check('AI 优先', scan.final_text({'ai_text': 'AI版', 'draft_text': '草稿版'}) == 'AI版')
+check('AI 空则用草稿', scan.final_text({'ai_text': '', 'draft_text': '草稿版'}) == '草稿版')
+check('两边都空返回空串', scan.final_text({}) == '')
+
+print('== 7. run_ai_batch 并发 + 降级 ==')
+real = scan.ai_read_one
+scan.ai_read_one = lambda item, subject='通用': (
+    {'success': True, 'text': f"AI:{item['idx']}"} if item['idx'] % 2
+    else {'success': False, 'error': '限流'})
+items = [{'idx': i, 'crop_abs': __file__} for i in range(1, 5)]
+stat = scan.run_ai_batch(items, workers=3)
+check('成功 2 道', stat['ok'] == 2, stat)
+check('失败 2 道', stat['fail'] == 2, stat)
+check('成功的写回 ai_text', items[0]['ai_text'] == 'AI:1')
+check('失败的记 ai_error', items[1]['ai_error'] == '限流')
+
+
+def boom(item, subject='通用'):
+    raise RuntimeError('线程池炸了')
+
+
+def serial_ok(item, subject='通用'):
+    return {'success': True, 'text': 'S'}
+
+
+scan.ai_read_one = serial_ok
+scan.run_ai_batch(items[:2], workers=2)
+check('异常后退化成串行仍出结果', items[0]['ai_text'] == 'S')
+scan.ai_read_one = real
+
+print('== 8. save_batch 批量入库 ==')
+db.init_db()
+sheet_rel = 'sheet_test.jpg'
+payload = [
+    {'idx': 1, 'crop_rel': 'crop1.png', 'crop_abs': '', 'ai_text': '第一题', 'draft_text': ''},
+    {'idx': 2, 'crop_rel': 'crop2.png', 'crop_abs': '', 'ai_text': '', 'draft_text': '第二题草稿'},
+    {'idx': 3, 'crop_rel': 'crop3.png', 'crop_abs': '', 'ai_text': '', 'draft_text': ''},
+]
+res = scan.save_batch(payload, subject='数学', upload_dir=os.path.join(tmpdir, 'uploads'),
+                      parent_photo=sheet_rel)
+check('存进 2 条(空题面跳过)', len(res['ids']) == 2, res)
+check('跳过 1 条', res['skipped'] == 1, res)
+
+rows = db.list_mistakes(subject='数学', limit=10)
+check('库里条数对', len(rows) == 2, len(rows))
+by_q = {r['question']: r for r in rows}
+check('AI 版优先入库', '第一题' in by_q)
+check('草稿也能入库', '第二题草稿' in by_q)
+r1 = by_q['第一题']
+check('配图是裁剪图', r1['image_path'] == 'crop1.png', r1['image_path'])
+check('记了原卷路径', r1['parent_photo'] == sheet_rel, r1['parent_photo'])
+check('来源标 photo', r1['source'] == 'photo', r1['source'])
+
+print('== 9. 组件可用性 ==')
+ok, why = scan.cropper_ready()
+check('画框组件可用', ok is True, why)
+
+print('== 10. 上限 ==')
+check('最多 20 道', scan.MAX_CROPS == 20)
+
+print(f'\n结果: {PASS} 通过 / {FAIL} 失败')
+raise SystemExit(1 if FAIL else 0)

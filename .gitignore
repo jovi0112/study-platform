@@ -23,6 +23,8 @@ uploads/
 
 # 本地密钥(API Key 等),绝不上传
 .streamlit/secrets.toml
+.streamlit/secrets.toml.bak*
+.streamlit/*.bak*
 secrets.toml
 .env
 .env.*
@@ -53,6 +55,8 @@ _t*.bat
 
 # 本地测试产生的临时图
 _*.png
+# 浏览器实测截图目录
+_shots/
 
 # 本地临时预览/应急脚本
 _preview_*.py

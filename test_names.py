@@ -14,7 +14,7 @@ import os
 import sys
 
 FILES = ['app.py', 'db.py', 'quiz.py', 'diagram.py', 'llm.py', 'ocr.py',
-         'backup.py', 'web_search.py']
+         'backup.py', 'web_search.py', 'scan.py']
 
 # 运行时由 Streamlit / 宿主注入的名字, 静态看不出来
 ALLOW = {'st', '__file__', '__name__', '__doc__', 'self', 'cls'}
