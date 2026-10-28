@@ -1198,6 +1198,8 @@ if page == '📷 拍照录入':
                 st.info(_rot_msg)
 
             st.markdown('**① 拖一个框圈住一道题的题干（可含孩子的解答）**')
+            st.caption('一个框只圈一道题。圈整页会慢 5 倍（实测整页 17~34 秒，单题 3.4 秒），'
+                       '还会把孩子的手写答案、老师批改一起抄进题面。')
             _raw_box = st_cropper(_sheet_img, return_type='box', box_color='#e8453c',
                                   realtime_update=True, key=f'cropper_{_seq}')
             _rect = scan.normalize_rect(_raw_box, _sheet_img.size)
@@ -1243,8 +1245,14 @@ if page == '📷 拍照录入':
                         _boxes0 = st.session_state.get('sheet_boxes')
                         if _boxes0:
                             _draft = scan.lines_in_rect(_boxes0, _rc).replace('\n', ' / ')
+                        _iw, _ih = _sheet_img.size
+                        _ratio = scan.box_ratio(_rc, (_iw, _ih))
                         st.caption(f'左 {_rc[0]} 上 {_rc[1]} · 宽 {_rc[2]-_rc[0]} 高 {_rc[3]-_rc[1]}'
                                    + (f'\n\n本地草稿：{_draft[:60]}' if _draft else ''))
+                        if _ratio > 0.55:
+                            st.caption(f'⚠️ 这个框占了整页 {_ratio*100:.0f}% —— 像是圈了整张卷子。'
+                                       '建议删掉，改成一道题一个框：更快，而且不会把孩子的手写答案'
+                                       '抄进题面。')
                     with _c:
                         if st.button('❌', key=f'del_crop_{_seq}_{_i}'):
                             st.session_state['crop_list'] = [
@@ -1281,12 +1289,23 @@ if page == '📷 拍照录入':
                             'ai_text': '', 'ai_error': None,
                         })
                     if _use_ai:
-                        # 一张裁剪图实测要 5~15 秒(两遍校对), 必须给进度条, 否则用户以为卡死
-                        _prog = st.progress(0.0, text=f'AI 逐题看图… 0/{len(_items)} 道')
+                        # 一张裁剪图实测要 5~15 秒(两遍校对), 整页或赶上限流能到 1 分钟,
+                        # 必须给进度条 + 等待说明, 否则用户以为卡死(实测 54 秒白屏)
+                        _pst = {'d': 0, 'n': max(1, len(_items))}
+                        _prog = st.progress(0.0, text=f'AI 逐题看图… 0/{_pst["n"]} 道')
+
+                        def _on_prog(_d, _n, _pst=_pst, _prog=_prog):
+                            _pst['d'], _pst['n'] = _d, max(1, _n)
+                            _prog.progress(_d / max(1, _n), text=f'AI 逐题看图… {_d}/{_n} 道')
+
+                        def _on_note(_txt, _pst=_pst, _prog=_prog):
+                            _head = _txt or 'AI 逐题看图…'
+                            _prog.progress(_pst['d'] / _pst['n'],
+                                           text=f'{_head} {_pst["d"]}/{_pst["n"]} 道')
+
                         _stat = scan.run_ai_batch(
                             _items, subject=_c_subject, workers=3,
-                            on_progress=lambda _d, _n: _prog.progress(
-                                _d / max(1, _n), text=f'AI 逐题看图… {_d}/{_n} 道'))
+                            on_progress=_on_prog, on_note=_on_note)
                         _prog.empty()
                         st.session_state['crop_ai_stat'] = _stat
                     st.session_state['crop_items'] = _items
@@ -1322,9 +1341,20 @@ if page == '📷 拍照录入':
                                 st.caption('预览失败')
                         with _p2:
                             if _it.get('ai_text'):
-                                st.caption('✅ 题面来自 AI 看图（已校对两遍）')
+                                if _it.get('ai_verified'):
+                                    st.caption('✅ 题面来自 AI 看图（抄完又校对了一遍）')
+                                else:
+                                    st.caption('✅ 题面来自 AI 看图（整页大图只抄一遍，'
+                                               '数字和符号请重点核对）')
                             elif _it.get('ai_error'):
-                                st.caption(f"⚠️ AI 没认出来（{_it['ai_error']}），下面是本地草稿，务必核对")
+                                st.caption(f"⚠️ AI 这次没认出来：{_it['ai_error']}")
+                                # 单题重试 —— 不用整批重跑, 省配额也省时间
+                                if st.button('🔁 只重认这道', key=f"retry_{_it['idx']}"):
+                                    with st.spinner('重新看图…（撞上排队会自动等，最坏约 1 分钟）'):
+                                        scan.ai_retry_one(_it, subject=_c_subject)
+                                    st.session_state['crop_items'] = _items
+                                    st.session_state.pop(f"crop_text_{_it['idx']}", None)
+                                    st.rerun()
                             else:
                                 st.caption('📝 本地草稿（没开 AI 复核）')
                             _default = scan.final_text(_it)

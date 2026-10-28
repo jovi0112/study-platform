@@ -130,48 +130,107 @@ _VISION_VERIFY_PROMPT = """你是"校对员"。下面给你一张题目图片和
 6) 如果草稿已经完全正确, 就原样输出"""
 
 
-def _vision_call(client, **kw):
+VISION_WAITS = (0, 15, 30)   # 首次 + 最多两次重试(等 15s / 30s)
+
+# 超过这个面积就不做第二遍校对(约 1200x750).
+# 实测(真卷 1279x1706 = 218 万像素): 整页抄一遍 17~34 秒, 服务端排队波动极大;
+# 再发一遍校对 = 配额翻倍 + 时间翻倍, 而整页本来就抄得全, 校对收益远小于代价.
+# 单题裁剪块(896x376 = 34 万像素)照常校对两遍 —— 那才是错字高发区.
+# 优先按像素判断: 同样一页, 压缩质量不同体积能差一倍, 像素数不会变.
+VERIFY_MAX_PIXELS = 900_000
+VERIFY_MAX_BYTES = 120 * 1024   # 拿不到尺寸时按体积退而求其次
+
+
+def auto_verify(nbytes: int, pixels: int = None) -> bool:
+    """这张图还要不要跑第二遍校对. pixels 拿不到时按体积退化判断."""
+    if pixels:
+        return int(pixels) <= VERIFY_MAX_PIXELS
+    return int(nbytes or 0) <= VERIFY_MAX_BYTES
+
+
+def _pixels_of(image_bytes: bytes):
+    """读图尺寸, 只为决定要不要校对; 读不出来就返回 None"""
+    try:
+        import io as _io
+        from PIL import Image as _Image
+        w, h = _Image.open(_io.BytesIO(image_bytes)).size
+        return int(w) * int(h)
+    except Exception:
+        return None
+
+
+def _vision_call(client, on_wait=None, **kw):
     """
     带限流重试的视觉模型调用.
-    glm-4.6v-flash 等免费模型是时段性共享配额, 高峰会间歇性 429(错误码 1302/1305),
+    免费/共享配额的视觉模型在高峰会间歇性 429(错误码 1302/1305),
     官方口径是"等 15 秒以上重试 1-2 次即可". 这事不该让孩子手动做, 程序自动等+重试.
+
+    on_wait(attempt, seconds): 进入等待前回调. 界面靠它显示"正在排队, 还有 N 秒",
+    否则整段等待是完全静默的 —— 实测 54 秒白屏, 孩子以为卡死了.
     """
     import time as _time
-    waits = (0, 15, 30)  # 首次 + 最多两次重试(等 15s / 30s)
     last_err = None
-    for i, w in enumerate(waits):
+    for i, w in enumerate(VISION_WAITS):
         if w:
+            if on_wait:
+                try:
+                    on_wait(i, w)
+                except Exception:
+                    pass        # 界面回调炸了不能影响重试本身
             _time.sleep(w)
         try:
             return client.chat.completions.create(**kw)
         except Exception as e:
             msg = str(e)
-            if ('429' in msg or '1302' in msg or '1305' in msg) and i < len(waits) - 1:
+            if ('429' in msg or '1302' in msg or '1305' in msg) and i < len(VISION_WAITS) - 1:
                 last_err = e
                 continue
             raise
     raise last_err
 
 
+def error_code(msg: str) -> str:
+    """把异常归成几类, 界面据此给不同的下一步建议(别用一句'限流'糊所有情况)"""
+    m = (msg or '').lower()
+    if '429' in m or '1302' in m or '1305' in m or 'rate limit' in m:
+        return 'rate_limit'
+    if 'timeout' in m or 'timed out' in m:
+        return 'timeout'
+    if '401' in m or 'invalid_api_key' in m or 'authentication' in m:
+        return 'auth'
+    if '402' in m or 'insufficient balance' in m:
+        return 'balance'
+    if 'ascii' in m and 'codec' in m:
+        return 'bad_secret'
+    return 'other'
+
+
 def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通用',
-               verify: bool = True) -> dict:
+               verify: bool = None, on_wait=None) -> dict:
     """
     AI 看图: 把图片交给视觉模型抄出题目原文.
 
-    verify=True 时会做第二遍校对: 把第一遍的草稿和原图逐字核对后再输出最终版.
-    手写题第一遍总会有几个字认岔, 校对一遍能拦掉大部分, 换来的是孩子少手动改.
+    verify=None 时按体积自动决定: 小图(单题裁剪块)校对两遍, 大图(整页)只抄一遍.
+    手写题第一遍总会有几个字认岔, 校对一遍能拦掉大部分; 但整页图发两遍的代价是
+    配额翻倍、时间翻倍, 而服务端高峰本来就容易 429 —— 先保证能出结果.
 
-    返回: {'success': bool, 'text': str, 'error': str|None, 'model': str}
+    on_wait(attempt, seconds): 等配额时的回调, 给界面显示进度用.
+
+    返回: {'success': bool, 'text': str, 'error': str|None, 'code': str, 'model': str}
     """
     stt = vision_status()
     if not stt['enabled']:
         return {'success': False, 'text': '', 'error': f"看图功能未启用: {stt['reason']}",
-                'model': stt['model']}
+                'code': 'disabled', 'model': stt['model']}
     if not image_bytes:
-        return {'success': False, 'text': '', 'error': '图片为空', 'model': stt['model']}
+        return {'success': False, 'text': '', 'error': '图片为空',
+                'code': 'empty', 'model': stt['model']}
     bad = _non_ascii_cfg_problem()
     if bad:
-        return {'success': False, 'text': '', 'error': bad, 'model': stt['model']}
+        return {'success': False, 'text': '', 'error': bad,
+                'code': 'bad_secret', 'model': stt['model']}
+    if verify is None:
+        verify = auto_verify(len(image_bytes), _pixels_of(image_bytes))
     try:
         from openai import OpenAI
         import base64 as _b64
@@ -183,6 +242,7 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
         # ---- 第一遍: 抄 ----
         resp = _vision_call(
             client,
+            on_wait=on_wait,
             model=VISION_MODEL,
             messages=[
                 {"role": "system", "content": _VISION_PROMPT},
@@ -196,13 +256,16 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
         )
         text = (resp.choices[0].message.content or '').strip()
         if not text:
-            return {'success': False, 'text': '', 'error': '模型返回空内容', 'model': VISION_MODEL}
+            return {'success': False, 'text': '', 'error': '模型返回空内容',
+                    'code': 'empty_result', 'model': VISION_MODEL}
 
         # ---- 第二遍: 校对(失败不影响结果, 退回第一遍草稿) ----
+        verified = False
         if verify:
             try:
                 resp2 = _vision_call(
                     client,
+                    on_wait=on_wait,
                     model=VISION_MODEL,
                     messages=[
                         {"role": "system", "content": _VISION_VERIFY_PROMPT},
@@ -219,12 +282,16 @@ def read_image(image_bytes: bytes, mime: str = 'image/jpeg', subject: str = '通
                 fixed = (resp2.choices[0].message.content or '').strip()
                 if fixed:
                     text = fixed
+                    verified = True
             except Exception:
                 pass  # 校对挂了不算失败, 用第一遍结果
 
-        return {'success': True, 'text': text, 'error': None, 'model': VISION_MODEL}
+        return {'success': True, 'text': text, 'error': None, 'code': 'ok',
+                'verified': verified, 'model': VISION_MODEL}
     except Exception as e:
-        return {'success': False, 'text': '', 'error': _humanize_error(str(e)), 'model': VISION_MODEL}
+        raw = str(e)
+        return {'success': False, 'text': '', 'error': _humanize_error(raw),
+                'code': error_code(raw), 'model': VISION_MODEL}
 
 
 # ============== 共享提示词前缀 ==============
@@ -255,23 +322,31 @@ def _default_model():
 
 
 def _humanize_error(msg: str) -> str:
-    """把 LLM 原始异常翻译成人话"""
-    if 'ascii' in msg and 'codec' in msg:
+    """把 LLM 原始异常翻译成人话。
+
+    措辞只说我们确定的事：
+    - 撞了限流就说"服务商配额排队"，不说"免费档"——型号可能是付费的，说错会误导排查方向；
+    - 超时就说超时，别混进限流里（两者下一步动作不同：超时该重试，鉴权错重试一百次也没用）。
+    """
+    code = error_code(msg)
+    if code == 'bad_secret':
         return ("请求里混入了非英文字符, 发不出去 — 多半是 Key/接口地址复制时带上了"
                 "中文引号或全角空格。请到 Secrets 检查 STUDY_VISION_* 的值, "
                 "只保留英文/数字/短横线。")
-    if '402' in msg or 'Insufficient Balance' in msg:
-        return ("服务商账户余额不足 — 请到 platform.deepseek.com 充值后再试 "
+    if code == 'balance':
+        return ("服务商账户余额不足 — 请到服务商后台充值后再试 "
                "(DeepSeek 最低充 10 元, 按用量扣费)")
-    if '401' in msg or 'Authentication' in msg or 'invalid_api_key' in msg.lower():
-        return "API Key 无效或已失效 — 请检查 STUDY_LLM_API_KEY 是否填错/被删除"
-    if '429' in msg or '1302' in msg or '1305' in msg:
-        return ("免费视觉模型限流了(免费档并发少, 高峰时段会间歇性这样) — "
-                "程序已自动等 15-30 秒重试过; 若还是失败, 等 1 分钟再点「再认一次」就好, 不用花钱")
+    if code == 'auth':
+        return "API Key 无效或已失效 — 请检查 STUDY_VISION_API_KEY 是否填错/被删除"
+    if code == 'rate_limit':
+        return (f"服务商配额排队中（{VISION_MODEL or '视觉模型'} 这个模型当前太挤）— "
+                "程序已自动等 15 秒、30 秒各重试一次；仍失败就等 1 分钟再点「只重认这道」，"
+                "不用花钱。想更稳可以把 STUDY_VISION_MODEL 换成 Qwen/Qwen3-VL-30B-A3B-Instruct"
+                "（实测整页 18.8 秒，比 32B 快一半）")
+    if code == 'timeout':
+        return "请求超时 — 服务商当前响应慢，隔一会儿点「只重认这道」重试即可"
     if '404' in msg:
-        return "接口地址或模型名不对 — 请检查 STUDY_LLM_BASE_URL 和 STUDY_LLM_MODEL"
-    if 'timeout' in msg.lower():
-        return "请求超时 — 检查网络, 或服务商是否在维护"
+        return "接口地址或模型名不对 — 请检查 STUDY_VISION_BASE_URL 和 STUDY_VISION_MODEL"
     return msg
 
 

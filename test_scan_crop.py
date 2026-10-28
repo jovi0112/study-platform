@@ -216,5 +216,124 @@ if os.path.exists(sheet):
 else:
     print('  ! 缺少 mock_sheet.png, 跳过横图用例')
 
+print('== 15. 大图不做第二遍校对(省一半配额) ==')
+import llm
+check('单题裁剪块(896x376)要校对', llm.auto_verify(47 * 1024, 896 * 376) is True)
+check('整页图(1279x1706)只抄一遍', llm.auto_verify(226 * 1024, 1279 * 1706) is False)
+check('A4 300dpi 整页也只抄一遍', llm.auto_verify(600 * 1024, 2480 * 3508) is False)
+check('拿不到尺寸时按体积退化', llm.auto_verify(47 * 1024) is True)
+check('大体积但无尺寸也要保守跳过校对', llm.auto_verify(400 * 1024) is False)
+check('空图也当小图走正常流程', llm.auto_verify(0) is True)
+
+print('== 16. 错误分类与文案: 不许把超时/鉴权混说成限流 ==')
+check('429 归为配额', llm.error_code('Error code: 429 - rate limit') == 'rate_limit')
+check('1302 归为配额', llm.error_code('{"code":1302}') == 'rate_limit')
+check('超时单独一类', llm.error_code('Request timed out') == 'timeout')
+check('401 归鉴权', llm.error_code('Error code: 401 - invalid_api_key') == 'auth')
+_h429 = llm._humanize_error('Error code: 429 - rate limited')
+_h_to = llm._humanize_error('Request timed out after 90s')
+check('配额文案提到会自动重试', '重试' in _h429, _h429)
+check('配额文案不再硬说"免费档"', '免费' not in _h429, _h429)
+check('超时文案说超时', '超时' in _h_to, _h_to)
+check('超时文案不冒充限流', '配额' not in _h_to and '限流' not in _h_to, _h_to)
+
+print('== 17. 等配额时界面要能说话(不能 54 秒白屏) ==')
+_ow = []
+
+
+class _FakeClient:
+    """每次调用都抛 429, 用来验证重试链"""
+
+    def __init__(self):
+        self.calls = 0
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kw):
+        self.calls += 1
+        raise RuntimeError('Error code: 429 - rate limit exceeded')
+
+
+_fc = _FakeClient()
+_old_waits = llm.VISION_WAITS
+llm.VISION_WAITS = (0, 0.01, 0.01)   # 别真等 15+30 秒
+try:
+    try:
+        llm._vision_call(_fc, on_wait=lambda a, s: _ow.append((a, s)), model='x')
+        _raised = False
+    except Exception:
+        _raised = True
+finally:
+    llm.VISION_WAITS = _old_waits
+check('429 三次都败后抛出', _raised)
+check('重试了 3 次', _fc.calls == 3, _fc.calls)
+check('每次等待前都回调界面', _ow == [(1, 0.01), (2, 0.01)], _ow)
+
+_orig_read = scan.ai_read_one
+
+
+def _slow_read(it, subject='通用', on_wait=None):
+    if on_wait:
+        on_wait(1, 0.6)
+    import time as _t
+    _t.sleep(0.9)          # 让主线程轮询(0.4s 一次)有机会读到等待状态
+    return {'success': True, 'text': '第 1 题 抄写结果', 'verified': True, 'code': 'ok'}
+
+
+_notes = []
+_tmp_items = [{'idx': 1, 'crop_abs': os.path.abspath(__file__), 'ai_text': '', 'ai_error': None}]
+scan.ai_read_one = _slow_read
+try:
+    _st = scan.run_ai_batch(_tmp_items, subject='数学', workers=1, on_note=_notes.append)
+finally:
+    scan.ai_read_one = _orig_read
+check('等待时进度条有话说', any(n and '排队' in n for n in _notes), _notes)
+check('跑完把提示收回(清空)', _notes and _notes[-1] is None, _notes[-1] if _notes else None)
+check('等待不影响结果', _st['ok'] == 1 and _tmp_items[0]['ai_text'] == '第 1 题 抄写结果', _st)
+check('记下"校对过"标记', _tmp_items[0].get('ai_verified') is True)
+
+print('== 18. 单题重认(失败后不用整批重跑) ==')
+
+
+def _ok_read(it, subject='通用', on_wait=None):
+    return {'success': True, 'text': '重认后的题面', 'verified': False, 'code': 'ok'}
+
+
+def _fail_read(it, subject='通用', on_wait=None):
+    return {'success': False, 'text': '', 'code': 'rate_limit', 'error': '排队中'}
+
+
+_it = {'idx': 2, 'crop_abs': os.path.abspath(__file__), 'ai_text': '', 'ai_error': '旧错误'}
+scan.ai_read_one = _ok_read
+try:
+    scan.ai_retry_one(_it, '数学')
+finally:
+    scan.ai_read_one = _orig_read
+check('重认成功写回题面', _it['ai_text'] == '重认后的题面')
+check('重认成功清掉旧错误', _it['ai_error'] is None)
+check('没校对也如实记下', _it['ai_verified'] is False)
+
+_it2 = {'idx': 3, 'crop_abs': os.path.abspath(__file__), 'ai_text': '', 'ai_error': None}
+scan.ai_read_one = _fail_read
+try:
+    scan.ai_retry_one(_it2, '数学')
+finally:
+    scan.ai_read_one = _orig_read
+check('重认失败留下原因', _it2['ai_error'] == '排队中', _it2['ai_error'])
+check('重认失败带错误码(界面据此给建议)', _it2['ai_code'] == 'rate_limit', _it2.get('ai_code'))
+
+print('== 19. box_ratio: 判断"是不是圈了整页" ==')
+_sz = (1279, 1706)
+check('整页框约 83%(1160x1570 / 全图)', abs(scan.box_ratio((60, 80, 1220, 1650), _sz) - 0.835) < 0.005,
+      scan.box_ratio((60, 80, 1220, 1650), _sz))
+check('单题框约 5%', scan.box_ratio((100, 400, 700, 560), _sz) < 0.2,
+      scan.box_ratio((100, 400, 700, 560), _sz))
+check('整页框过 55% 线(会提示)', scan.box_ratio((60, 80, 1220, 1650), _sz) > 0.55)
+check('单题框不过线(不打扰)', scan.box_ratio((100, 400, 700, 560), _sz) <= 0.55)
+check('空框返回 0', scan.box_ratio(None, _sz) == 0.0)
+check('尺寸为 0 不除零', scan.box_ratio((0, 0, 10, 10), (0, 0)) == 0.0)
+check('脏数据返回 0', scan.box_ratio(('a', 'b', 'c', 'd'), _sz) == 0.0)
+check('超出图片也夹在 1.0 以内', scan.box_ratio((-99, -99, 9999, 9999), _sz) <= 1.0)
+
 print(f'\n结果: {PASS} 通过 / {FAIL} 失败')
 raise SystemExit(1 if FAIL else 0)

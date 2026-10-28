@@ -199,6 +199,26 @@ def normalize_rect(raw: dict, img_size: tuple) -> tuple:
     return (l, t, r, b)
 
 
+def box_ratio(rect: tuple, img_size: tuple) -> float:
+    """
+    框占整张图的比例(0~1)。用来判断"这个框是不是圈了整页"。
+
+    实测: 单题裁剪块约占 3%~12%, 整页 85%~95%。中间空档很大, 阈值怎么取都不敏感。
+    界面靠它提醒"框太大" —— 圈整页会慢 5 倍, 而且把孩子的手写答案一起抄进题面。
+    """
+    if not rect:
+        return 0.0
+    try:
+        w, h = float(img_size[0]), float(img_size[1])
+        if w <= 0 or h <= 0:
+            return 0.0
+        l, t, r, b = rect
+        area = max(0.0, (r - l)) * max(0.0, (b - t))
+        return max(0.0, min(1.0, area / (w * h)))
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+
+
 def crop_image(abs_path: str, rect: tuple) -> "Image.Image":
     l, t, r, b = rect
     img = Image.open(abs_path)
@@ -303,15 +323,17 @@ def _to_jpeg_bytes(abs_path: str, max_side: int = 2000, quality: int = 90) -> by
             return f.read()
 
 
-def ai_read_one(item: dict, subject: str = '通用') -> dict:
+def ai_read_one(item: dict, subject: str = '通用', on_wait=None) -> dict:
     """对单张裁剪图调 AI 看图。失败不抛, 把原因放进 item。"""
     path = item.get('crop_abs')
     if not path or not os.path.exists(path):
-        return {'success': False, 'error': '裁剪图不见了', 'text': ''}
+        return {'success': False, 'error': '裁剪图不见了', 'code': 'missing', 'text': ''}
     try:
-        r = llm.read_image(_to_jpeg_bytes(path), mime='image/jpeg', subject=subject)
+        r = llm.read_image(_to_jpeg_bytes(path), mime='image/jpeg', subject=subject,
+                           on_wait=on_wait)
     except Exception as e:
-        return {'success': False, 'error': f"{type(e).__name__}: {str(e)[:80]}", 'text': ''}
+        return {'success': False, 'code': 'other',
+                'error': f"{type(e).__name__}: {str(e)[:80]}", 'text': ''}
     # 抄出来的 Markdown 表格/加粗, 进错题本会被 md_safe 转义成一堆竖线, 这里先转纯文本
     if isinstance(r, dict) and r.get('success') and (r.get('text') or '').strip():
         clean = plainify(r['text'])
@@ -319,12 +341,18 @@ def ai_read_one(item: dict, subject: str = '通用') -> dict:
     return r
 
 
-def run_ai_batch(items: list, subject: str = '通用', workers: int = 3, on_progress=None) -> dict:
+def run_ai_batch(items: list, subject: str = '通用', workers: int = 3,
+                 on_progress=None, on_note=None) -> dict:
     """
     并发调 AI 看图(网络调用并发, 写结果回主线程 —— 和 diagram.py 一个规矩)。
-    on_progress(done, total) 在主线程回调, 界面可以据此推进度条 ——
-    实测一张裁剪图要 5~15 秒(两遍校对), 大图或赶上限流能到 1 分钟,
-    没有进度条的话用户会以为卡死。
+
+    on_progress(done, total): 完成几道
+    on_note(text):           当前状态一句话(排队等待中/恢复正常), 在主线程调用
+
+    为什么不用 as_completed 阻塞: 那样主线程会一直卡到有结果为止, 期间界面完全静止。
+    实测一次 429 重试链要 45 秒以上, 用户看到的是"点完什么都不动", 只能以为卡死。
+    改成每 0.4 秒醒一次, 把 worker 写进 _wait_state 的等待信息读出来画到进度条上。
+
     返回 {'ok': n, 'fail': n, 'seconds': s}
     """
     todo = [it for it in items if it.get('crop_abs')]
@@ -335,6 +363,7 @@ def run_ai_batch(items: list, subject: str = '通用', workers: int = 3, on_prog
     total = len(todo)
     done = 0
     pairs = []          # [(item, result)] —— 结果回主线程再写回 item
+    _wait_state = {}    # {idx: (第几次重试, 还要等几秒)} —— worker 写, 主线程读
 
     def _tick():
         nonlocal done
@@ -345,20 +374,68 @@ def run_ai_batch(items: list, subject: str = '通用', workers: int = 3, on_prog
             except Exception:
                 pass        # 进度条画不出来不能影响识别本身
 
+    def _make_wait(idx):
+        def _w(attempt, sec):
+            _wait_state[idx] = (attempt, sec)
+        return _w
+
+    # 探测一下当前的 ai_read_one 认不认 on_wait:
+    # 只吃两个参数的旧实现/测试替身不能因为多了个可选参数就整批失败。
+    import inspect
     try:
-        from concurrent.futures import as_completed
+        _has_wait = 'on_wait' in inspect.signature(ai_read_one).parameters
+    except (TypeError, ValueError):
+        _has_wait = False
+
+    def _call_read(it):
+        if _has_wait:
+            return ai_read_one(it, subject, on_wait=_make_wait(it.get('idx', 0)))
+        return ai_read_one(it, subject)
+
+    def _report_wait():
+        if not on_note:
+            return
+        if not _wait_state:
+            on_note(None)
+            return
+        # 有多道同时在等时, 报最晚的那个(用户关心还要多久才能全好)
+        attempt, sec = max(_wait_state.values(), key=lambda x: x[1])
+        left = len(_wait_state)
+        on_note(f'服务商配额排队中，自动重试（第 {attempt} 次，等 {sec} 秒'
+                f'{"，" + str(left) + " 道在等" if left > 1 else ""}）…')
+
+    try:
+        from concurrent.futures import FIRST_COMPLETED
+        from concurrent.futures import wait as _fwait
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(ai_read_one, it, subject): it for it in todo}
-            for f in as_completed(futs):
-                pairs.append((futs[f], f.result()))
-                _tick()
+            futs = {ex.submit(_call_read, it): it for it in todo}
+            pending = set(futs)
+            while pending:
+                _done, pending = _fwait(pending, timeout=0.4, return_when=FIRST_COMPLETED)
+                for f in _done:
+                    _wait_state.pop(futs[f].get('idx', 0), None)
+                    try:
+                        pairs.append((futs[f], f.result()))
+                    except Exception as e:
+                        pairs.append((futs[f], {'success': False, 'code': 'other',
+                                                'error': f'{type(e).__name__}: {str(e)[:60]}',
+                                                'text': ''}))
+                    _tick()
+                _report_wait()
     except Exception:
         # 并发出任何问题就退化成串行, 不能因为线程池问题整批不出结果
         pairs = []
         done = 0
+        _wait_state.clear()
         for it in todo:
-            pairs.append((it, ai_read_one(it, subject)))
+            pairs.append((it, _call_read(it)))
             _tick()
+
+    if on_note:
+        try:
+            on_note(None)
+        except Exception:
+            pass
 
     ok = 0
     for it, r in pairs:
@@ -366,10 +443,27 @@ def run_ai_batch(items: list, subject: str = '通用', workers: int = 3, on_prog
         if r.get('success') and (r.get('text') or '').strip():
             it['ai_text'] = r['text'].strip()
             it['ai_error'] = None
+            it['ai_code'] = 'ok'
+            it['ai_verified'] = bool(r.get('verified'))
             ok += 1
         else:
             it['ai_error'] = r.get('error') or 'AI 没认出来'
+            it['ai_code'] = r.get('code') or 'other'
     return {'ok': ok, 'fail': total - ok, 'seconds': round(time.time() - t0, 1)}
+
+
+def ai_retry_one(item: dict, subject: str = '通用') -> dict:
+    """只重认一道(失败后不用整批重跑, 省配额也省时间)。返回处理后的 item。"""
+    r = ai_read_one(item, subject)
+    if r.get('success') and (r.get('text') or '').strip():
+        item['ai_text'] = r['text'].strip()
+        item['ai_error'] = None
+        item['ai_code'] = 'ok'
+        item['ai_verified'] = bool(r.get('verified'))
+    else:
+        item['ai_error'] = r.get('error') or 'AI 没认出来'
+        item['ai_code'] = r.get('code') or 'other'
+    return item
 
 
 def final_text(item: dict) -> str:
