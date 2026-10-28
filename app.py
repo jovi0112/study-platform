@@ -160,6 +160,29 @@ if _MISSING_API:
     )
     st.stop()
 
+# ---- scan 模块自检（同上。画框多选用它；它缺函数时只跳过这一块，不拖垮整页）----
+_SCAN_NEED = ('cropper_ready', 'ocr_boxes', 'lines_in_rect', 'normalize_rect',
+              'crop_image', 'save_crop', 'run_ai_batch', 'final_text', 'save_batch',
+              'MAX_CROPS',
+              # 方向 + 去表格装饰（2026-10-28 真卷实测后加）
+              'crop_from', 'guess_sideways', 'plainify')
+
+
+def _scan_missing():
+    return [n for n in _SCAN_NEED if not hasattr(scan, n)]
+
+
+_MISSING_SCAN = _scan_missing()
+if _MISSING_SCAN:
+    try:
+        import importlib
+        importlib.reload(scan)
+        _MISSING_SCAN = _scan_missing()
+    except Exception as _e:
+        _MISSING_SCAN = _MISSING_SCAN or ['reload 失败：%s' % _e]
+
+HAS_SHEET_CROP = not _MISSING_SCAN
+
 # 每日测试模块的表(试卷/题目/掌握度/AI 题库)
 quiz.init_quiz_db()
 
@@ -1122,7 +1145,11 @@ if page == '📷 拍照录入':
         st.info('先在「1. 上传题目照片」传一张卷子，然后回到这里画框。')
     else:
         _cok, _cwhy = scan.cropper_ready()
-        if not _cok:
+        if not HAS_SHEET_CROP:
+            st.warning('后台还在跑旧版的 scan 模块（缺 ' + '、'.join(_MISSING_SCAN[:3])
+                       + '），画框这块先跳过，其它功能不受影响。'
+                       '线上点右下角 **Manage app → Reboot app**，本地重开 streamlit 即可。')
+        elif not _cok:
             st.warning(f'画框组件没装上（{_cwhy}）—— 现在只能用上面「一次一道」的方式录入。')
         else:
             from streamlit_cropper import st_cropper
@@ -1133,7 +1160,43 @@ if page == '📷 拍照录入':
             except Exception:
                 _sheet_img = Image.open(_sheet_abs)
 
+            # ---- 方向：手机拍的卷子经常横着存（实测一张真卷 1279x1706 内容就是横的）----
+            _rot = int(st.session_state.get('sheet_rot') or 0) % 360
+            if _rot:
+                _sheet_img = _sheet_img.rotate(-_rot, expand=True)
+
             _seq = int(st.session_state.get('crop_seq') or 0)
+
+            def _spin(delta):
+                """转图。坐标全变了，已画的框和 OCR 缓存必须一起作废，
+                否则转完还留着旧框 —— 框的位置和内容对不上，用户完全看不出哪里错了。"""
+                st.session_state['sheet_rot'] = (_rot + delta) % 360
+                st.session_state['crop_list'] = []
+                st.session_state['crop_seq'] = _seq + 1
+                st.session_state.pop('crop_items', None)
+                st.session_state.pop('crop_ai_stat', None)
+                st.session_state.pop('sheet_boxes', None)
+                st.session_state['crop_rot_msg'] = '已旋转，请重新画框。'
+                st.rerun()
+
+            _r1, _r2, _r3 = st.columns([1.1, 1.1, 2.8])
+            with _r1:
+                if st.button('↺ 左转 90°', use_container_width=True, key=f'rot_l_{_seq}'):
+                    _spin(-90)
+            with _r2:
+                if st.button('↻ 右转 90°', use_container_width=True, key=f'rot_r_{_seq}'):
+                    _spin(90)
+            with _r3:
+                # 内部角度是 0/90/180/270（顺时针累计），直接显示"270°"会让人以为是左转 270
+                _rot_txt = {0: '原始方向', 90: '右转 90°', 180: '转了 180°',
+                            270: '左转 90°'}.get(_rot, f'{_rot}°')
+                st.caption(f'当前：{_rot_txt}。照片横着放的先转正再画框 —— '
+                           '转正后本地草稿的文字顺序才对（AI 抄题不受方向影响，但草稿会乱）。')
+
+            _rot_msg = st.session_state.pop('crop_rot_msg', None)
+            if _rot_msg:
+                st.info(_rot_msg)
+
             st.markdown('**① 拖一个框圈住一道题的题干（可含孩子的解答）**')
             _raw_box = st_cropper(_sheet_img, return_type='box', box_color='#e8453c',
                                   realtime_update=True, key=f'cropper_{_seq}')
@@ -1171,7 +1234,7 @@ if page == '📷 拍照录入':
                     _a, _b, _c = st.columns([1, 5, 1])
                     with _a:
                         try:
-                            st.image(scan.crop_image(_sheet_abs, _rc), width=90,
+                            st.image(scan.crop_from(_sheet_img, _rc), width=90,
                                      caption=f'第 {_i} 题')
                         except Exception:
                             st.caption(f'第 {_i} 题(预览失败)')
@@ -1206,11 +1269,11 @@ if page == '📷 拍照录入':
                              type='primary', key=f'run_crop_{_seq}'):
                     if st.session_state.get('sheet_boxes') is None:
                         with st.spinner('先给整张卷子做一次文字定位（约 3 秒）…'):
-                            st.session_state['sheet_boxes'] = scan.ocr_boxes(_sheet_abs)
+                            st.session_state['sheet_boxes'] = scan.ocr_boxes(_sheet_abs, _rot)
                     _bx = st.session_state.get('sheet_boxes') or []
                     _items = []
                     for _i, _rc in enumerate(_lst, 1):
-                        _rel, _absp = scan.save_crop(scan.crop_image(_sheet_abs, _rc),
+                        _rel, _absp = scan.save_crop(scan.crop_from(_sheet_img, _rc),
                                                      _sheet_rel, _i, UPLOAD_DIR)
                         _items.append({
                             'idx': _i, 'rect': _rc, 'crop_rel': _rel, 'crop_abs': _absp,
@@ -1230,6 +1293,14 @@ if page == '📷 拍照录入':
                     for _it in _items:
                         st.session_state.pop(f"crop_text_{_it['idx']}", None)
                     st.rerun()
+
+            # 常驻判断，别用一次性 flag —— flag 会被任意一次 rerun（连接重连、点到别处）
+            # 吃掉，用户什么都看不到。实测设了 True 页面上却没有，就是栽在这。
+            _sbx = st.session_state.get('sheet_boxes')
+            if _sbx and scan.guess_sideways(_sbx):
+                st.warning('这张照片是横着放的（文字被认成了竖长条）。AI 抄题不受方向影响，'
+                           '但「本地草稿」的文字顺序会乱。建议点上面的「↺ 左转 90°」'
+                           '转正后重新画框，草稿才靠得住。')
 
             _items = st.session_state.get('crop_items') or []
             if _items:

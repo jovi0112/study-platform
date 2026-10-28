@@ -161,5 +161,60 @@ check('画框组件可用', ok is True, why)
 print('== 10. 上限 ==')
 check('最多 20 道', scan.MAX_CROPS == 20)
 
+print('== 11. plainify: AI 抄出来的 Markdown 表格要转纯文本 ==')
+# 真卷实测: 股票涨跌题被 AI 抄成 md 表格, 进错题本经 md_safe 转义后塌成一行竖线
+md = ('23. 小王买进股票…\n'
+      '| 星期 | 一 | 二 | 三 |\n'
+      '|------|----|----|----|\n'
+      '| 每股涨跌 | +2 | +1.7 | -1.9 |\n'
+      '**注意**：下同\n'
+      '### 小题\n'
+      '- 第一条\n'
+      '* 第二条\n')
+p = scan.plainify(md)
+check('表格分隔行被删掉', '---' not in p, p)
+check('表格首行转成「列名：值 ｜ 值」', '星期：一 ｜ 二 ｜ 三' in p, p)
+check('表格第二行同样处理', '每股涨跌：+2 ｜ +1.7 ｜ -1.9' in p, p)
+check('不再残留半角竖线', '|' not in p, p)
+check('** 加粗被去掉', '**' not in p and '注意：下同' in p, p)
+check('# 标题符号被去掉', '###' not in p and '小题' in p, p)
+check('列表符号换成 ·', '· 第一条' in p and '· 第二条' in p, p)
+check('正文没被吃掉', '23. 小王买进股票' in p, p)
+check('空串安全', scan.plainify('') == '')
+check('单行表格也能转', scan.plainify('| a | b |') == 'a：b', scan.plainify('| a | b |'))
+check('普通文字原样返回', scan.plainify('解方程 2x-5=9') == '解方程 2x-5=9')
+check('数学符号不被误改', scan.plainify('(-81) ÷ 2¼ × (-4/9)') == '(-81) ÷ 2¼ × (-4/9)')
+
+print('== 12. guess_sideways: 照片横着放要能识别 ==')
+h_rows = [{'text': 'x', 'conf': .9, 'x0': 0, 'x1': 800, 'y0': i * 40, 'y1': i * 40 + 30}
+          for i in range(5)]
+v_rows = [{'text': 'x', 'conf': .9, 'x0': i * 60, 'x1': i * 60 + 40, 'y0': 0, 'y1': 300}
+          for i in range(5)]
+check('横排文字不报警', scan.guess_sideways(h_rows) is False)
+check('竖长条报警', scan.guess_sideways(v_rows) is True)
+check('空列表不报警', scan.guess_sideways([]) is False)
+check('只有两行竖条不报(避免误判)', scan.guess_sideways(v_rows[:2]) is False)
+
+print('== 13. crop_from: 从内存里的图裁(界面转正后必须用这个) ==')
+base = _Image.new('RGB', (200, 100), 'white')
+c = scan.crop_from(base, (10, 20, 110, 80))
+check('裁剪尺寸对', c.size == (100, 60), c.size)
+check('转正后画布换向', base.rotate(-90, expand=True).size == (100, 200))
+
+print('== 14. 横图实测: ocr_boxes 的 rotate_deg 要跟着界面一起转 ==')
+if os.path.exists(sheet):
+    side_path = os.path.join(tmpdir, 'sideways.png')
+    _Image.open(sheet).rotate(-90, expand=True).convert('RGB').save(side_path)
+    bx_side = scan.ocr_boxes(side_path)
+    check('横着存的图被认成竖条(会提示用户转正)', scan.guess_sideways(bx_side) is True,
+          f'{len(bx_side)} 行')
+    bx_fix = scan.ocr_boxes(side_path, 90)
+    check('带 rotate_deg 转回来后不再是竖条', scan.guess_sideways(bx_fix) is False,
+          f'{len(bx_fix)} 行')
+    txt_all = scan.lines_in_rect(bx_fix, (0, 0, 1754, 1240))
+    check('转正后全图能取到"解方程"', '解方程' in txt_all.replace(' ', ''), txt_all[:80])
+else:
+    print('  ! 缺少 mock_sheet.png, 跳过横图用例')
+
 print(f'\n结果: {PASS} 通过 / {FAIL} 失败')
 raise SystemExit(1 if FAIL else 0)

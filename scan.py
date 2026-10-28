@@ -18,9 +18,18 @@
     - 裁剪后送 AI 看图: `(-81) ÷ 2¼ × (-4/9) ÷ (-8)` 全对, 选项 A/B/C/D 顺序也对
     → 所以本地草稿只做预览, **入库用 AI 那版**; AI 没开就用草稿并明说是草稿
 
+真卷实测(2026-10-28, 手机拍的数学卷 1279x1706, 内容是横着存的):
+    - AI 抄题**三个方向全都抄对了**(连表格都还原了), 横着不转也认对 → 方向不影响 AI
+    - 但本地 OCR 在横图上把每行认成"竖长条"(59x437), 草稿顺序整个倒乱(从最后一句往前)
+      → 所以界面给了「左转/右转」按钮, 并用 guess_sideways() 主动提示
+    - 三个方向的 OCR 字符数只有 269/290/263(差 8%), **别用"哪边认得多"猜方向, 会猜错**
+    - AI 会把表格抄成 Markdown 表格, 进错题本被 md_safe 转义后会塌成一行竖线
+      → 入库前统一过 plainify() 转纯文本
+
 裁剪图不要再跑本地 OCR(实测反而更差: 小块被放大后长宽比扭曲, 检测器失去整页上下文)。
 """
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -30,7 +39,7 @@ from PIL import Image, ImageOps
 import ocr
 import llm
 
-MODULE_VER = 1
+MODULE_VER = 2      # v2: 加旋转 / crop_from / guess_sideways / plainify (2026-10-28 真卷)
 
 # 一次最多框多少道(防止误操作框出几百个)
 MAX_CROPS = 20
@@ -46,11 +55,38 @@ def cropper_ready() -> tuple:
         return False, f"{type(e).__name__}: {str(e)[:60]}"
 
 
+# ============== 方向 ==============
+def guess_sideways(boxes: list) -> bool:
+    """
+    文字框是不是被识别成"竖长条"—— 那是整张照片横着存的典型症状。
+
+    2026-10-28 真卷实测(1279x1706, 手机拍的股票涨跌题):
+        - 原样(横):  行框 59x437, 高/宽 = 7.4, 一半以上都是这种竖条
+        - 转正之后:  行框 1434x67, 高/宽 = 0.05
+    差距 100 倍以上, 判据很硬。三方向的字符数只有 269/290/263(差 8%),
+    **所以别用"哪个方向认得多"来猜方向, 会猜错**; 用长宽比。
+
+    只做提示, 不自动转 —— 转错了更麻烦, 让用户自己按一下。
+    """
+    if not boxes:
+        return False
+    tall = 0
+    for b in boxes:
+        w = max(1.0, b['x1'] - b['x0'])
+        h = b['y1'] - b['y0']
+        if h / w >= 3.0:
+            tall += 1
+    return tall >= 3 and tall >= len(boxes) * 0.5
+
+
 # ============== 带坐标的 OCR ==============
-def ocr_boxes(abs_path: str) -> list:
+def ocr_boxes(abs_path: str, rotate_deg: int = 0) -> list:
     """
     跑一次本地 OCR 并**保留文本框坐标**(ocr.py 里的版本把 box 丢了)。
     坐标换算回原图尺寸, 界面拿到的框坐标可以直接比对。
+
+    rotate_deg: 跟界面上「左转/右转」同一个角度。**界面转正了图, 这里必须一起转**,
+    否则坐标还停在原方向, 框内文字归属全错(框住 A 题却取到 B 题的草稿)。
     """
     eng = ocr._get_engine()
     if eng is None:
@@ -61,6 +97,8 @@ def ocr_boxes(abs_path: str) -> list:
             img = ImageOps.exif_transpose(img)
         except Exception:
             pass
+        if rotate_deg:
+            img = img.rotate(-rotate_deg, expand=True)
         orig_w = img.size[0]
         big = ocr._maybe_upscale(img)
         scale = (big.size[0] / orig_w) if orig_w else 1.0
@@ -171,6 +209,18 @@ def crop_image(abs_path: str, rect: tuple) -> "Image.Image":
     return img.crop((l, t, r, b))
 
 
+def crop_from(img: "Image.Image", rect: tuple) -> "Image.Image":
+    """
+    从**已经拿在手上的图**裁剪。
+
+    为什么要单独一个: crop_image 每次都重新读盘 + exif_transpose, 它不认界面上的旋转
+    —— 用户把图转正了, 裁出来还是横的(框和内容错位)。界面那边必须把转正后的图
+    传进来裁, 预览和识别用同一张, 才不会"看到的"和"存下来的"不是一个东西。
+    """
+    l, t, r, b = rect
+    return img.crop((l, t, r, b))
+
+
 def save_crop(img: "Image.Image", orig_name: str, idx: int, upload_dir: str) -> tuple:
     """裁剪图存到 uploads/, 返回 (相对名, 绝对路径)"""
     os.makedirs(upload_dir, exist_ok=True)
@@ -179,6 +229,61 @@ def save_crop(img: "Image.Image", orig_name: str, idx: int, upload_dir: str) -> 
     abs_path = os.path.join(upload_dir, name)
     img.convert('RGB').save(abs_path, format='PNG')
     return name, abs_path
+
+
+# ============== 抄题结果去装饰 ==============
+_TABLE_SEP = re.compile(r'^[\s:|\-]+$')
+
+
+def plainify(text: str) -> str:
+    """
+    把 AI 抄题结果里的 Markdown 装饰去掉, 变成纯文本行。
+
+    为什么必须做(2026-10-28 真卷实测):
+    错题本题面走的是 `st.write(quiz.md_safe(m['question']))`, md_safe 会把 `|` 转义成 `\\|`。
+    而 AI 一看到表格(股票涨跌、实验数据这类题特别多)就输出
+        | 星期 | 一 | 二 | 三 |
+        |------|----|----|----|
+        | 每股涨跌 | +2 | +1.7 | -1.9 |
+    转义之后表格彻底塌成一行竖线 `\\| 星期 \\| 一 \\| ...`, 分隔行变成一长串 `------`,
+    孩子看到的是一堆符号, 表格信息全丢 —— 而这类题恰恰靠表格读题。
+
+    所以入库前统一转成:
+        星期：一 ｜ 二 ｜ 三
+        每股涨跌：+2 ｜ +1.7 ｜ -1.9
+    用全角 ｜ 分隔, 它不在 md_safe 的转义名单里, 怎么渲染都不会变形。
+    顺手去掉 ** 加粗 / # 标题 / 反引号, 行首 - * + 列表符号换成 ·
+    """
+    if not text:
+        return ''
+    out, prev_blank = [], False
+    for raw in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        s = raw.strip()
+
+        # 表格的分隔行 |---|---| 直接丢掉(它没有内容)
+        if s and _TABLE_SEP.match(s):
+            continue
+
+        # 表格数据行 -> "第一列：其他列 ｜ 其他列"
+        if s.startswith('|') and s.endswith('|') and s.count('|') >= 2:
+            cells = [c.strip() for c in s.strip('|').split('|') if c.strip()]
+            if cells:
+                s = cells[0] if len(cells) == 1 else f"{cells[0]}：" + ' ｜ '.join(cells[1:])
+
+        s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)      # **粗体** -> 粗体
+        s = s.replace('**', '').replace('`', '')     # 落单的 ** 和反引号
+        s = re.sub(r'^#{1,6}\s*', '', s)             # ### 标题 -> 标题
+        s = re.sub(r'^[-*+]\s+', '· ', s)            # - 列表 -> · 列表
+
+        if not s:
+            if prev_blank:
+                continue
+            prev_blank = True
+            out.append('')
+        else:
+            prev_blank = False
+            out.append(s)
+    return '\n'.join(out).strip()
 
 
 # ============== AI 看图(单题) ==============
@@ -204,9 +309,14 @@ def ai_read_one(item: dict, subject: str = '通用') -> dict:
     if not path or not os.path.exists(path):
         return {'success': False, 'error': '裁剪图不见了', 'text': ''}
     try:
-        return llm.read_image(_to_jpeg_bytes(path), mime='image/jpeg', subject=subject)
+        r = llm.read_image(_to_jpeg_bytes(path), mime='image/jpeg', subject=subject)
     except Exception as e:
         return {'success': False, 'error': f"{type(e).__name__}: {str(e)[:80]}", 'text': ''}
+    # 抄出来的 Markdown 表格/加粗, 进错题本会被 md_safe 转义成一堆竖线, 这里先转纯文本
+    if isinstance(r, dict) and r.get('success') and (r.get('text') or '').strip():
+        clean = plainify(r['text'])
+        r['text'] = clean or r['text'].strip()
+    return r
 
 
 def run_ai_batch(items: list, subject: str = '通用', workers: int = 3, on_progress=None) -> dict:
