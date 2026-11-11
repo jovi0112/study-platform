@@ -39,7 +39,7 @@ def make_dir(tag):
     os.makedirs(os.path.join(d, 'data'))
     os.makedirs(os.path.join(d, '.streamlit'))
     for f in ('app.py', 'db.py', 'llm.py', 'ocr.py', 'scan.py', 'web_search.py',
-              'backup.py', 'diagram.py', 'quiz.py'):
+              'backup.py', 'diagram.py', 'quiz.py', 'notes.py', 'notes_forge.py'):
         shutil.copy(os.path.join(HERE, f), d)
     for f in os.listdir(os.path.join(HERE, 'data')):
         if f.endswith('.json'):

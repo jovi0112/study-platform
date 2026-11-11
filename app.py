@@ -22,6 +22,7 @@ import backup
 import quiz
 import diagram
 import scan
+import notes
 # ============== 路径 ==============
 APP_DIR = os.path.dirname(__file__)
 UPLOAD_DIR = os.path.join(APP_DIR, 'uploads')
@@ -208,6 +209,31 @@ if _MISSING_SCAN or _STALE_MODS:
     _STALE_MODS = _mod_ver_issue()
 
 HAS_SHEET_CROP = not _MISSING_SCAN and not _STALE_MODS
+
+# ---- notes 模块自检（笔记工坊。同一条铁律：新界面 + 旧进程内存 = AttributeError）----
+_NOTES_NEED = ('ready', 'token_status', 'generate', 'list_lessons', 'load_lesson',
+               'page_image', 'render_lesson', 'lesson_key_for', 'gallery_sub_for',
+               'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int')
+_NOTES_WANT = 1     # 要求 notes.MODULE_VER >= 1
+
+
+def _notes_missing():
+    return [n for n in _NOTES_NEED if not hasattr(notes, n)]
+
+
+_MISSING_NOTES = _notes_missing()
+if _MISSING_NOTES:
+    try:
+        import importlib
+        importlib.reload(notes)      # notes 模块体只 import streamlit/标准库，reload 无顺序问题
+        _MISSING_NOTES = _notes_missing()
+    except Exception:
+        pass
+HAS_NOTES = not _MISSING_NOTES and int(getattr(notes, 'MODULE_VER', 0) or 0) >= _NOTES_WANT
+if not HAS_NOTES:
+    # 只让笔记工坊这一页不可用，不拖垮整站（和 scan 的降级同一个思路）
+    _NOTES_ISSUE = ('内存里跑的还是旧 notes 模块：缺 ' + '、'.join(_MISSING_NOTES[:3])) \
+        if _MISSING_NOTES else f'notes 模块版本过旧（要 v{_NOTES_WANT}）'
 
 # 旧模块的人话说明（别只说"出错了"——用户会以为是自己操作错了）
 _MOD_ISSUE_TEXT = ''
@@ -520,6 +546,7 @@ page = st.sidebar.radio('导航', [
     '📖 错题本',
     '🔁 复习计划',
     '🧠 知识点图谱',
+    '🗒️ 笔记工坊',
     '📊 学习统计',
     '🧪 我的工作室',
     '👨‍👩‍👧 家长端',
@@ -2205,6 +2232,109 @@ elif page == '👨‍👩‍👧 家长端':
                     conn.execute("DELETE FROM reviews")
                 st.warning('已清空, 刷新页面查看.')
 
+
+# ============== 页面 6.5: 笔记工坊 ==============
+elif page == '🗒️ 笔记工坊':
+    st.title('🗒️ 笔记工坊')
+    st.caption('上传一份课堂笔记 PDF，自动整理成「一分钟总结 + 模块正文 + 例题精讲 + 自测」，'
+               f'并存进 GitHub 仓库（{notes.REPO}）——换电脑、换手机都能看。')
+
+    if not HAS_NOTES:
+        st.error(_NOTES_ISSUE + '\n\n线上：右下角 **Manage app → Reboot app**；本地：重启 streamlit。')
+        st.stop()
+
+    _ok, _why = notes.ready()
+    _prob = []
+    if not _ok:
+        _prob.append(_why)
+    else:
+        _ts = notes.token_status()
+        if not _ts['ok'] and _ts.get('reason') != 'repo_not_created':
+            _prob.append('存档通道不通：' + _ts['reason'])
+    if _prob:
+        for _p in _prob:
+            st.error(_p)
+        st.stop()
+
+    tab_gen, tab_read = st.tabs(['📤 上传 PDF 生成', '📚 已生成的笔记'])
+
+    with tab_gen:
+        _SUBJ_CODE = {'数学': 'math', '语文': 'chinese', '英语': 'english'}
+        c1, c2 = st.columns(2)
+        subj = c1.selectbox('科目', list(_SUBJ_CODE), key='nt_subj')
+        no = c2.number_input('讲号', 1, 99, 8, key='nt_no')
+        title = st.text_input('这一讲的标题（照老师 PPT 封面填）', key='nt_title',
+                              placeholder='例：名著专题：《水浒传》必考考点')
+        up = st.file_uploader('课堂笔记 PDF', type=['pdf'], key='nt_pdf')
+        st.caption('一讲 50~60 页约需 4~8 分钟（逐页看图）。期间别关页面；'
+                   '生成完自动存档，断言不过就不会写进仓库（宁可不出，不出错的）。')
+
+        if st.button('🚀 开始生成', type='primary', disabled=not up, key='nt_go'):
+            if not (title or '').strip():
+                st.error('先填标题 —— 逐页识别、骨架和讲解都靠它对准主题。')
+            else:
+                _code = _SUBJ_CODE[subj]
+                key = notes.lesson_key_for(_code, int(no))
+                _ids = [e.get('id') for e in notes.list_lessons()]
+                if key in _ids:
+                    st.warning(f'{key} 已存在，本次生成会覆盖它。')
+                _prog = st.progress(0.0, text='准备…')
+                _logc = st.container()
+                with st.status('生成中…（详细过程在下方黑区）', expanded=True) as _stat:
+                    def _log(s):
+                        _logc.write(s)
+
+                    def _pr(done, total, pno):
+                        _prog.progress(min(done / max(total, 1), 1.0),
+                                       text=f'逐页识别 {done}/{total}（第 {pno} 页完成）')
+
+                    try:
+                        _res = notes.generate(up.read(), _code, int(no),
+                                              title.strip(), on_log=_log, on_progress=_pr)
+                    except Exception as e:  # noqa: BLE001
+                        _res = None
+                        st.error(f'生成中断：{e}')
+                        _stat.update(label='❌ 中断', state='error')
+                    if _res and _res.get('ok'):
+                        _stat.update(label='✅ 完成', state='complete', expanded=False)
+                        _prog.progress(1.0, text='完成')
+                        r = _res['report']
+                        st.success(f"**{key} 已生成并存档**：{r['sections']} 模块 / "
+                                   f"{r['examples']} 例题 / {r['quiz']} 自测 / "
+                                   f"{r['pitfalls']} 雷区，用时 {r['seconds']} 秒")
+                        if r.get('warnings'):
+                            st.warning('模型没做满的地方（显式说，不静默）：' + '；'.join(r['warnings']))
+                        if r.get('pages_failed'):
+                            st.warning('识别失败的页：' + '、'.join(map(str, r['pages_failed'])) +
+                                       ' —— 这些页不进正文，关键内容丢了就重传试试')
+                        if r.get('orphan_pages'):
+                            st.caption('没进正文、只留在画廊的页：' +
+                                       '、'.join(map(str, r['orphan_pages'])))
+                        notes.list_lessons.clear()      # 清目录缓存，切到查看页就能看到
+                        st.session_state['nt_done'] = key
+                    elif _res:
+                        _stat.update(label='❌ 结构断言没过', state='error')
+                        for e in _res['report'].get('errors') or []:
+                            st.error(e)
+                        st.info('这次的数据没有写进仓库（断言不过绝不入库）。'
+                                '通常是模型这一轮输出不全，再点一次「开始生成」多数就好。')
+
+    with tab_read:
+        lessons = notes.list_lessons()
+        if not lessons:
+            st.info('还没有生成过任何一讲。先去「📤 上传 PDF 生成」。')
+        else:
+            _order = {'math': 0, 'chinese': 1, 'english': 2}
+            lessons = sorted(lessons, key=lambda e: (_order.get(e.get('subject'), 9),
+                                                     notes.no_int(e)))
+            labels = [f"{e.get('course', '')} 第{e.get('no')}讲 · {e.get('title', '')}"
+                      for e in lessons]
+            pick = st.selectbox('选一讲', labels, key='nt_pick')
+            try:
+                L = notes.load_lesson(lessons[labels.index(pick)]['id'])
+                notes.render_lesson(L)
+            except Exception as e:  # noqa: BLE001
+                st.error(f'这份笔记的数据暂时取不到：{e}（网络抖动，刷新重试）')
 
 # ============== 页面 7: 设置 ==============
 elif page == '⚙️ 设置':
