@@ -215,7 +215,7 @@ _NOTES_NEED = ('ready', 'token_status', 'generate', 'list_lessons', 'load_lesson
                'page_image', 'render_lesson', 'lesson_key_for', 'gallery_sub_for',
                'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int',
                'selfcheck', 'vision_status')
-_NOTES_WANT = 2     # 要求 notes.MODULE_VER >= 2（v2 加了看图自检）
+_NOTES_WANT = 3     # 要求 notes.MODULE_VER >= 3（v3 会连带 reload notes_forge）
 
 
 def _notes_missing():
@@ -223,14 +223,18 @@ def _notes_missing():
 
 
 _MISSING_NOTES = _notes_missing()
-if _MISSING_NOTES:
+_STALE_NOTES = int(getattr(notes, 'MODULE_VER', 0) or 0) < _NOTES_WANT
+if _MISSING_NOTES or _STALE_NOTES:
+    # 注意：版本旧但属性齐的时候也要 reload。2026-11-11 的坑是——只检查"缺属性"，
+    # 于是 notes 里的新逻辑（连带 reload notes_forge）永远不生效，页面一直报旧错。
     try:
         import importlib
         importlib.reload(notes)      # notes 模块体只 import streamlit/标准库，reload 无顺序问题
         _MISSING_NOTES = _notes_missing()
+        _STALE_NOTES = int(getattr(notes, 'MODULE_VER', 0) or 0) < _NOTES_WANT
     except Exception:
         pass
-HAS_NOTES = not _MISSING_NOTES and int(getattr(notes, 'MODULE_VER', 0) or 0) >= _NOTES_WANT
+HAS_NOTES = not _MISSING_NOTES and not _STALE_NOTES
 if not HAS_NOTES:
     # 只让笔记工坊这一页不可用，不拖垮整站（和 scan 的降级同一个思路）
     _NOTES_ISSUE = ('内存里跑的还是旧 notes 模块：缺 ' + '、'.join(_MISSING_NOTES[:3])) \

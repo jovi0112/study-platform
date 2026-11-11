@@ -321,5 +321,9 @@ ok(int(getattr(N, '_FORGE_WANT', 0)) <= int(getattr(F, 'MODULE_VER', 0)),
    f'notes._FORGE_WANT({getattr(N, "_FORGE_WANT", "?")}) ≤ notes_forge.MODULE_VER({getattr(F, "MODULE_VER", "?")})'
    ' —— 否则线上会一直判"模块太旧"，页面进不去')
 ok(int(getattr(F, 'MODULE_VER', 0)) >= 2, 'notes_forge 有版本号（selfcheck 那次没 reload 就是因为没有它）')
+_m = _re.search(r'_NOTES_WANT\s*=\s*(\d+)', need_src)
+ok(_m and int(_m.group(1)) == int(N.MODULE_VER),
+   f'app.py 的 _NOTES_WANT 等于 notes.MODULE_VER（bump 了忘了同步的话，页面会一直判"模块太旧"）'
+   f' | {_m.group(1) if _m else "?"} vs {N.MODULE_VER}')
 
 print(f'\nALL NOTES CHECKS OK ({PASS} 项)')

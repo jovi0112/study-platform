@@ -26,7 +26,8 @@ import time
 from datetime import date as _date
 from pathlib import Path
 
-MODULE_VER = 2          # 改接口必须 bump，app.py 里 _NOTES_WANT 同步改（模块守卫铁律）
+MODULE_VER = 3          # 改接口必须 bump，app.py 里 _NOTES_WANT 同步改（模块守卫铁律）
+# v3：_forge() 会比对 notes_forge.MODULE_VER 并就地 reload（v2 只 reload 了自己）
 REPO = 'jovi0112/notes-data'
 BRANCH = 'main'
 CDN = f'https://cdn.jsdelivr.net/gh/{REPO}@{BRANCH}'
