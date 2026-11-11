@@ -196,7 +196,7 @@ calls = []
 
 
 def _fake_profile_one(page, course, no, title='', on_log=None, subject='math',
-                      mode='small', model=None):
+                      mode='small', model=None, rate_waits=None, **kw):
     calls.append((int(no), mode))
     if mode == 'small':                       # 模拟"并发时挂"
         raise F._EmptyAnswer(f'第 {no} 页模型返回空内容（finish_reason=stop）')
@@ -221,7 +221,7 @@ calls.clear()
 
 
 def _dead(page, course, no, title='', on_log=None, subject='math',
-          mode='small', model=None):
+          mode='small', model=None, rate_waits=None, **kw):
     calls.append((int(no), mode))
     raise TimeoutError()
 
@@ -316,7 +316,7 @@ calls.clear()
 
 
 def _bad_first(page, course, no, title='', on_log=None, subject='math',
-               mode='small', model=None):
+               mode='small', model=None, rate_waits=None, **kw):
     calls.append((int(no), mode))
     if int(no) <= 7:
         raise TimeoutError()
@@ -359,5 +359,105 @@ _m = _re.search(r'_NOTES_WANT\s*=\s*(\d+)', need_src)
 ok(_m and int(_m.group(1)) == int(N.MODULE_VER),
    f'app.py 的 _NOTES_WANT 等于 notes.MODULE_VER（bump 了忘了同步的话，页面会一直判"模块太旧"）'
    f' | {_m.group(1) if _m else "?"} vs {N.MODULE_VER}')
+
+# ============ 7. 第三轮线上实录（2026-11-11 16:40 那场）：NoSessionContext / 截断 JSON / 429 ============
+# 那场的结果：主并发 37/41 页报 NoSessionContext（异常无说明），单线程补跑立刻能过；
+# 另有 6 页「返回的不是 JSON」，内容其实是好的但被 ```json 围栏 + max_tokens 截断；
+# 其余大半是 429「该模型当前访问量过大」。三条都要钉住。
+print('--- worker 线程日志 / 截断 JSON / 限流退避 ---')
+
+# 7.1 截断 JSON 抢救：围栏 + 尾部缺 } —— 原样 json.loads 必失败，_repair_json 要能救
+_trunc = '```json\n{\n "role": "summary",\n "belongs": "this",\n "topic": "一元一次方程"'
+_r = F.extract_json(_trunc)
+ok(isinstance(_r, dict) and _r.get('role') == 'summary',
+   f'围栏 + 截断（缺尾括号）的 JSON 能被救回: {_r}')
+_r2 = F.extract_json('{"role":"content","topic":"绝对","points":["a","b",]}')
+ok(isinstance(_r2, dict) and _r2.get('topic') == '绝对', f'尾逗号也能修: {_r2}')
+_r3 = F.extract_json('{"role":"content","topic":"半截字符串')
+ok(isinstance(_r3, dict) and _r3.get('topic') == '半截字符串', f'截断在字符串中间 → 补引号: {_r3}')
+ok(F.extract_json('完全不是 JSON 的一段话') is None, '真不是 JSON 就返回 None（不假装成功）')
+ok(F._repair_json('{"a":1}}') is None, '括号交错时不硬猜（返回 None，宁可报错）')
+
+# 7.2 429 真退避：_retry 要按异常类型选等待计划
+_slept, _logged = [], []
+_orig_sleep = F.time.sleep
+F.time.sleep = lambda s: _slept.append(s)
+try:
+    _n = {'i': 0}
+
+
+    class _Rate(Exception):
+        pass
+
+
+    def _boom():
+        _n['i'] += 1
+        if _n['i'] < 3:
+            raise _Rate('Error code: 429 - 该模型当前访问量过大，请您稍后再试')
+        return 'ok'
+
+
+    _out = F._retry(_boom, tries=3, waits=(0, 1, 2), rate_waits=(0, 12, 24),
+                    on_log=_logged.append)
+finally:
+    F.time.sleep = _orig_sleep
+ok(_out == 'ok', '限流两次后第三次成功')
+ok(_slept == [12, 24], f'429 走 rate_waits（真等），不是秒级连发: {_slept}')
+ok(len(_logged) == 2 and '429' in _logged[0], f'每次失败都留日志: {_logged[0][:40]}')
+_slept.clear()
+_n['i'] = 0
+F.time.sleep = lambda s: _slept.append(s)
+try:
+    _n2 = {'i': 0}
+
+    def _boom2():
+        _n2['i'] += 1
+        if _n2['i'] < 3:
+            raise TimeoutError()
+        return 'ok'
+
+    F._retry(_boom2, tries=3, waits=(0, 1, 2), rate_waits=(0, 12))
+finally:
+    F.time.sleep = _orig_sleep
+ok(_slept == [1, 2], f'非限流还是短等待（别把超时也睡成 12 秒）: {_slept}')
+
+# 7.3 worker 线程不许调 on_log —— 用"线程 id 不对就炸"模拟 Streamlit 的 NoSessionContext
+import threading as _th
+_main = _th.current_thread()
+_log_threads, _page_calls = [], []
+
+
+def _thread_hostile(page, course, no, title='', on_log=None, subject='math',
+                    mode='small', model=None, rate_waits=None, **kw):
+    """替身：模拟 worker 线程里调日志（真 Streamlit 这里会抛 NoSessionContext）。"""
+    if on_log:
+        on_log(f'  第 {no} 页模拟一次失败日志')
+    if mode == 'small' and int(no) == 2:
+        raise TimeoutError()
+    return {'no': int(no), 'role': 'content', 'belongs': 'this', 'topic': 't',
+            'examples': [], 'points': [], 'handwriting': False, 'page_text': ''}
+
+
+def _main_only_log(s):
+    _log_threads.append(_th.current_thread())
+
+
+F.profile_one = _thread_hostile
+try:
+    pg = [{'no': i, 'img': b'x', 'img_small': b'y', 'text': ''} for i in (1, 2, 3)]
+    out4 = F.profile_pages(pg, '课', title='t', workers=3, on_log=_main_only_log)
+finally:
+    F.profile_one = _real_po
+ok(len(out4['pages']) == 3 and not out4['failed'],
+   f'并发里 worker 打日志不再拖死页面（{len(out4["pages"])} 页成功 / {len(out4["failed"])} 失败）')
+ok(_log_threads and all(t is _main for t in _log_threads),
+   f'所有 on_log 都在脚本线程里执行（worker 只写缓冲）: {len(_log_threads)} 条')
+
+# 7.4 主并发的限流退避要比补跑短 —— 否则 41 页各睡 20 秒
+_src_f = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'notes_forge.py'),
+              encoding='utf-8').read()
+ok('rate_waits=(0, 4, 8)' in _src_f and 'rate_waits=(0, 12, 24)' in _src_f,
+   '主并发/补跑各用一档退避（4/8 秒 vs 12/24 秒）')
+ok("STUDY_RESCUE_BUDGET', '420'" in _src_f, '补跑预算默认 420 秒（240 秒实测只够补 8 页）')
 
 print(f'\nALL NOTES CHECKS OK ({PASS} 项)')

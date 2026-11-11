@@ -36,11 +36,14 @@ except Exception:
 # pymupdf 是懒加载的：import 本模块不需要装它，只有真正跑 ingest 才 import。
 # 这样"笔记工坊"页面在依赖没装好时也能给出人话提示，而不是整站崩。
 
-# 版本号：改对外接口（run / selfcheck / profile_* / cfg_status）必须 bump。
-# 2026-11-11 踩过的坑：notes.py 自己 reload 了，notes_forge 没人 reload，
-# 新按钮点下去报「module 'notes_forge' has no attribute 'selfcheck'」——
-# 名单式守卫又漏一项。所以这里给版本号，由 notes._forge() 负责比对 + reload。
-MODULE_VER = 3
+# MODULE_VER = 4：2026-11-11 第三轮线上实录（智谱 glm-4.6v-flash）三个修复：
+#   ① worker 线程的 on_log 必须先进缓冲、主线程统一 flush——
+#      app.py 的 _log 回调碰 st 容器，在 ThreadPoolExecutor 线程里直接抛
+#      NoSessionContext，37/41 页全部死于"日志回调"而不是看图本身（单线程补跑全过）；
+#   ② 429 限流要真等：flash 免费模型整场都在 429，秒级重试毫无意义；
+#   ③ 截断 JSON 抢救：glm 把 JSON 用 ```json 围栏包住且尾部被 max_tokens 咬掉，
+#      之前整页作废（6 页其实内容是好的）。
+MODULE_VER = 4
 
 # ============================================================
 # 配置（与 llm.py 同一套键：STUDY_LLM_* / STUDY_VISION_*，
@@ -119,8 +122,45 @@ def cfg_status() -> dict:
 # 通用工具
 # ============================================================
 
+def _repair_json(s: str):
+    """
+    修被 max_tokens 截断的 JSON：补齐没闭合的引号 / 括号、去掉尾逗号。
+    2026-11-11 线上实录：glm-4.6v-flash 的回复被截断（尾部缺 }），
+    原来的"剥围栏 + 硬抠首尾"全部 loads 失败，6 页内容明明是好的整页作废。
+    修不好返回 None（不假装成功）。
+    """
+    t = re.sub(r',\s*([}\]])', r'\1', s)          # 尾逗号
+    stack, in_str, esc = [], False, False
+    for ch in t:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in '{[':
+            stack.append('}' if ch == '{' else ']')
+        elif ch in '}]':
+            if stack and stack[-1] == ch:
+                stack.pop()
+            else:
+                return None                        # 括号交错，救不了
+    if in_str:
+        t += '"'                                   # 截断在字符串中间 → 补引号
+    while stack:
+        t += stack.pop()                           # 截断在嵌套中间 → 补括号
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
+
+
 def extract_json(text: str):
-    """从模型回复里抠出 JSON。模型经常带 ```json 围栏或前后废话。"""
+    """从模型回复里抠出 JSON。模型经常带 ```json 围栏或前后废话，还可能被截断。"""
     if not text:
         return None
     s = text.strip()
@@ -137,6 +177,12 @@ def extract_json(text: str):
             return json.loads(s[i:j + 1])
         except Exception:
             pass
+    # 截断抢救：非空但被 max_tokens 咬掉尾部的回复
+    r = _repair_json(s)
+    if r is not None:
+        return r
+    if i >= 0:
+        return _repair_json(s[i:])
     return None
 
 
@@ -180,12 +226,26 @@ def _salvage_array(text: str, field: str) -> list:
     return out
 
 
-def _retry(fn, tries: int = 3, waits=(0, 3, 8), on_log=None):
-    """统一重试：网络抖动 / 429 / 解析失败都走这里，最终失败把最后一次异常抛出去。"""
+def _is_rate(e: BaseException) -> bool:
+    """429 / 限流。识别要宽：SDK 抛 RateLimitError，有的网关直接 4xx 带中文文案。"""
+    n = type(e).__name__
+    s = str(e)
+    return 'RateLimit' in n or '429' in s or '访问量过大' in s or 'rate limit' in s.lower()
+
+
+def _retry(fn, tries: int = 3, waits=(0, 3, 8), rate_waits=None, on_log=None):
+    """
+    统一重试：网络抖动 / 429 / 解析失败都走这里，最终失败把最后一次异常抛出去。
+    rate_waits：限流专用退避。2026-11-11 实测智谱 flash 整场 429，
+    秒级重试只会把配额打成连发，「该模型当前访问量过大，请您稍后再试」是真的要等。
+    """
     last = None
     for i in range(tries):
         if i:
-            time.sleep(waits[min(i, len(waits) - 1)])
+            w = waits[min(i, len(waits) - 1)]
+            if rate_waits and last is not None and _is_rate(last):
+                w = rate_waits[min(i, len(rate_waits) - 1)]
+            time.sleep(w)
         try:
             return fn()
         except Exception as e:  # noqa: BLE001
@@ -675,7 +735,7 @@ def _img_url(b64: str, style: str) -> str:
 
 def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
                 subject: str = 'math', mode: str = 'small',
-                model: str | None = None) -> dict:
+                model: str | None = None, rate_waits=None) -> dict:
     v = vision_cfg()
     if not v['key']:
         raise RuntimeError('看图模型未配置：需要 STUDY_VISION_API_KEY')
@@ -719,6 +779,7 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
             else ['dataurl', 'raw']
         b64 = base64.b64encode(_pick_img(page, mode)).decode()
         last: BaseException | None = None
+        truncated: str | None = None        # 非空但被截断的正文，最后兜底交出去
         tries = 0
         for style in styles:
             think_off, tokens = True, base_tokens
@@ -741,23 +802,33 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
                     rc = getattr(ch.message, 'reasoning_content', None) or ''
                     if rc.strip():
                         content = rc
-                if content.strip():
-                    return content
                 usage = getattr(resp, 'usage', None)
+                cut = ch.finish_reason == 'length'
+                if content.strip() and not cut:
+                    return content
+                if content.strip():
+                    # 2026-11-11 实录：glm 的 JSON 被截断但开头是好的，原来直接
+                    # 落进"返回的不是 JSON"整页作废。记下这份，加大预算重试；
+                    # 预算翻完还截断就交截断版（extract_json 的 _repair_json 兜底）
+                    truncated = content
                 last = _EmptyAnswer(
-                    f'第 {no} 页模型返回空内容（finish_reason={ch.finish_reason}，'
+                    f'第 {no} 页模型返回{"截断" if cut else "空"}内容'
+                    f'（finish_reason={ch.finish_reason}，'
                     f'completion_tokens={getattr(usage, "completion_tokens", "?")}，'
                     f'max_tokens={tokens}，model={getattr(resp, "model", use_model)}，'
                     f'图 {len(b64) * 3 // 4 // 1024}KB/{mode}，{style}'
                     f'{"，thinking=off" if think_off is False else ""}）')
-                if ch.finish_reason == 'length':
-                    tokens = int(tokens * 2.5)       # 被截断 → 加大预算再试
+                if cut:
+                    tokens = int(tokens * 2.5)       # 截断 → 加大预算再试
                     continue
                 break                                # 空但不是截断 → 换 style / 图
+        if truncated:
+            return truncated
         raise last or _EmptyAnswer(f'第 {no} 页模型返回空内容')
 
     try:
-        raw = _retry(lambda: _call(False), tries=2, waits=(0, 2), on_log=on_log)
+        raw = _retry(lambda: _call(False), tries=3, waits=(0, 2, 4),
+                     rate_waits=(rate_waits or (0, 8, 16)), on_log=on_log)
     except _EmptyAnswer:
         if on_log:
             on_log(f'  第 {no} 页空答，追加一句提示再试一次…')
@@ -793,11 +864,28 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
     """
     results, failed = {}, []
     done = 0
+    # ！！！worker 线程里绝对不能碰 Streamlit ！！！
+    # 2026-11-11 线上实录：37/41 页报 `NoSessionContext`（异常本身无说明），
+    # 而单线程补跑全部能过。真因不是看图，是 app.py 的 on_log 会写 st 容器
+    # （`_logc.write(s)`），而 ThreadPoolExecutor 线程没有 ScriptRunContext，
+    # 一写就抛 NoSessionContext —— 那一页的失败原因被"日志回调"顶掉了。
+    # 所以：worker 只往自己的缓冲里写，主线程在 as_completed 里统一 flush。
+    bufs: dict = {}
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futs = {ex.submit(profile_one, p, course, str(p['no']), title, on_log,
-                          subject): p['no'] for p in pages}
+        futs = {}
+        for p in pages:
+            buf: list = []
+            bufs[p['no']] = buf
+            sink = (lambda s, _b=buf: _b.append(s)) if on_log else None
+            # 主并发的限流退避短一些（真等交给单线程补跑），免得 41 页各睡 20 秒
+            futs[ex.submit(lambda _p=p, _s=sink: profile_one(
+                _p, course, str(_p['no']), title, _s, subject,
+                rate_waits=(0, 4, 8)))] = p['no']
         for fut in as_completed(futs):
             no = futs[fut]
+            if on_log:
+                for s in bufs.get(no, []):
+                    on_log(s)                       # 主线程写界面，安全
             try:
                 results[no] = fut.result()
             except Exception as e:  # noqa: BLE001
@@ -825,8 +913,10 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
         for mode, model in plans:
             tag = mode if not model else f'{mode}+{model.split("/")[-1]}'
             try:
+                # 补跑是单线程、主线程调用 on_log 安全；限流退避放长（真等）
                 results[no] = profile_one(page, course, str(no), title, on_log,
-                                          subject, mode=mode, model=model)
+                                          subject, mode=mode, model=model,
+                                          rate_waits=(0, 12, 24))
                 if on_log:
                     on_log(f'  第 {no} 页补跑成功（{tag}）')
                 return True
@@ -846,7 +936,9 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
         if on_log:
             on_log(f'  补跑（单线程，换小图重试；'
                    f'{"大面积失败，先探一页看接口通不通" if probe_only else f"共 {len(ordered)} 页"}）…')
-        budget = float(cfg('STUDY_RESCUE_BUDGET', '240') or 240)
+        # 240 秒实测只够补 8 页（41 页里 10 页被"超预算跳过"）；
+        # flash 免费模型整场 429，每次退避 12~24 秒，预算必须给够。
+        budget = float(cfg('STUDY_RESCUE_BUDGET', '420') or 420)
         t_rescue = time.time()
         first_ok = _rescue(ordered[0])
         if probe_only and not first_ok:

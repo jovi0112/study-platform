@@ -9,6 +9,7 @@ import time
 import json
 import math
 import base64
+import threading
 import streamlit as st
 from datetime import datetime
 from PIL import Image, ImageOps
@@ -215,7 +216,8 @@ _NOTES_NEED = ('ready', 'token_status', 'generate', 'list_lessons', 'load_lesson
                'page_image', 'render_lesson', 'lesson_key_for', 'gallery_sub_for',
                'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int',
                'selfcheck', 'vision_status')
-_NOTES_WANT = 4     # 要求 notes.MODULE_VER >= 4（bump 它 = 逼 app 重新加载 notes→notes_forge）
+_NOTES_WANT = 5     # 要求 notes.MODULE_VER >= 5（bump 它 = 逼 app 重新加载 notes→notes_forge）
+# v5 = 带上 notes_forge v4：worker 线程不碰 st（NoSessionContext 根因）、429 真退避、截断 JSON 抢救
 
 
 def _notes_missing():
@@ -2309,7 +2311,17 @@ elif page == '🗒️ 笔记工坊':
                 _prog = st.progress(0.0, text='准备…')
                 _logc = st.container()
                 with st.status('生成中…（详细过程在下方黑区）', expanded=True) as _stat:
+                    _HERE = threading.current_thread()   # 脚本线程，记住它
+                    _spill = []
+
                     def _log(s):
+                        # 兜底第二层：notes_forge 已保证 worker 只写缓冲、主线程才回调，
+                        # 但万一以后有人在别的线程里调到这里，st 容器会抛
+                        # NoSessionContext（2026-11-11 那 37 页就是这么被"日志"判死的）。
+                        # 规则：日志只是日志，写不进去不能把整页判失败 —— 先存着，出结果前补打。
+                        if threading.current_thread() is not _HERE:
+                            _spill.append(s)
+                            return
                         _logc.write(s)
 
                     def _pr(done, total, pno):
@@ -2327,6 +2339,8 @@ elif page == '🗒️ 笔记工坊':
                                     '先点上面那个「🔍 先测看图通道」，把那一行的报错发我；'
                                     '重复点「开始生成」不会有不同结果，只会多花钱。')
                         _stat.update(label='❌ 中断', state='error')
+                    for _s in _spill:            # 万一有日志是从别的线程漏进来的，出结果前补打
+                        _logc.write(_s)
                     if _res and _res.get('ok'):
                         _stat.update(label='✅ 完成', state='complete', expanded=False)
                         _prog.progress(1.0, text='完成')
