@@ -26,7 +26,7 @@ import time
 from datetime import date as _date
 from pathlib import Path
 
-MODULE_VER = 1          # 改接口必须 bump，app.py 里 _NOTES_WANT 同步改（模块守卫铁律）
+MODULE_VER = 2          # 改接口必须 bump，app.py 里 _NOTES_WANT 同步改（模块守卫铁律）
 REPO = 'jovi0112/notes-data'
 BRANCH = 'main'
 CDN = f'https://cdn.jsdelivr.net/gh/{REPO}@{BRANCH}'
@@ -73,6 +73,22 @@ def _token() -> str:
         except Exception:  # noqa: BLE001
             pass
     return tok
+
+
+def vision_status() -> dict:
+    """
+    看图通道的配置摘要（密钥只露头尾）。
+    存在的意义：线上挂了的时候，第一件要排除的就是「云端 secrets 填的是不是本地这套」。
+    """
+    v = _forge().vision_cfg()
+    k = v['key'] or ''
+    shown = (k[:6] + '…' + k[-4:]) if len(k) > 12 else ('（空）' if not k else '已配置')
+    return {'model': v['model'], 'base': v['base'], 'key': shown, 'key_len': len(k)}
+
+
+def selfcheck(pdf_bytes: bytes, subject: str = 'math') -> dict:
+    """只测第 1 页的看图通道（1 次调用）。界面上的「先测一下」按钮走这里。"""
+    return _forge().selfcheck(pdf_bytes, subject=subject)
 
 
 def token_status() -> dict:
@@ -339,7 +355,7 @@ def generate(pdf_bytes: bytes, subject: str, no: int, title: str,
     gsub = gallery_sub_for(subject, no)
     out = _forge().run(pdf_bytes, key, title, str(no), course,
                        _date.today().isoformat(), dist_dir=None,
-                       workers=6, on_log=log, on_progress=on_progress,
+                       workers=_forge().default_workers(), on_log=log, on_progress=on_progress,
                        subject=subject, gallery_sub=gsub, write_outputs=False)
     if not out['ok']:
         return {'ok': False, 'report': out['report'], 'key': key}

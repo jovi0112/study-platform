@@ -73,7 +73,23 @@ def vision_cfg() -> dict:
         'key': cfg('STUDY_VISION_API_KEY'),
         'base': cfg('STUDY_VISION_BASE_URL', 'https://api.siliconflow.cn/v1'),
         'model': cfg('STUDY_VISION_MODEL', 'Qwen/Qwen3-VL-32B-Instruct'),
+        # 主模型返回空内容/不认图时的替补（补跑阶段才会用到，正常不花钱）
+        'fallback': cfg('STUDY_VISION_FALLBACK_MODEL', 'Qwen/Qwen3-VL-8B-Instruct'),
     }
+
+
+def default_workers() -> int:
+    """
+    并发数。默认 4（原来是 6）。
+    降的理由：6 路并发打同一个看图接口，容易被限流/偶发空答；
+    4 路慢不了多少（41 页约多花 20 秒），但失败面小很多。
+    嫌慢可以在 secrets 里设 STUDY_VISION_WORKERS（1~8）自己调，不用改代码。
+    """
+    try:
+        n = int(cfg('STUDY_VISION_WORKERS', '4') or 4)
+    except Exception:  # noqa: BLE001
+        n = 4
+    return max(1, min(8, n))
 
 
 def cfg_status() -> dict:
@@ -164,8 +180,69 @@ def _retry(fn, tries: int = 3, waits=(0, 3, 8), on_log=None):
         except Exception as e:  # noqa: BLE001
             last = e
             if on_log:
-                on_log(f'  第 {i + 1} 次失败：{e}')
+                on_log(f'  第 {i + 1} 次失败：{err_text(e)}')
     raise last  # type: ignore[misc]
+
+
+class _EmptyAnswer(Exception):
+    """模型回了 200 但正文是空的。单独立一个类型，好和内网/限流分开处理。"""
+
+
+def err_text(e: BaseException, limit: int = 200) -> str:
+    """
+    异常的人话。写这条的原因是踩过的坑：云端 41 页全失败，
+    界面只显示「第 38 页看图失败：」，冒号后面空空如也——
+    因为那个异常的 str() 就是空字符串，我把类型和 repr 一起打出来才看得见。
+    """
+    name = type(e).__name__
+    detail = str(e).strip()
+    if not detail:
+        detail = repr(e) if repr(e) not in ('', f'{name}()') else '（异常本身没有带任何说明）'
+    return f'{name}: {detail}'[:limit]
+
+
+def _shrink_jpg(jpg: bytes, max_w: int = 790, q: int = 62) -> bytes:
+    """
+    给「重试」用的小图：宽压到 790px、质量 62 → 单页约 15~25KB。
+    失败页单线程补跑时用它，最省 token、最不容易被网关判为超大请求。
+    Pillow 不在（极简部署）就原样返回，不许因为压图把整页弄丢。
+    """
+    try:
+        import io
+
+        from PIL import Image
+        im = Image.open(io.BytesIO(jpg)).convert('RGB')
+        if im.width > max_w:
+            im = im.resize((max_w, max(1, round(im.height * max_w / im.width))), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, 'JPEG', quality=q, optimize=True)
+        out = buf.getvalue()
+        return out if out else jpg
+    except Exception:  # noqa: BLE001
+        return jpg
+
+
+def vision_guard(n_ok: int, n_total: int, failed: list, floor: float = 0.6) -> str | None:
+    """
+    识别率太低时给一句「人话」，而不是让它继续跑到「结构断言没过」。
+    这一点很重要：上一次云端 41 页只认出 2 页，界面最后说「断言没过，再点一次多数就好」，
+    把接口故障说成了模型这一轮发挥不好——用户会反复重试，白等白花钱。
+    """
+    if not n_total:
+        return None
+    rate = n_ok / n_total
+    if rate >= floor:
+        return None
+    uniq = []
+    for f in failed or []:
+        e = str(f.get('error') or '').strip()
+        if e and e not in uniq:
+            uniq.append(e)
+        if len(uniq) >= 3:
+            break
+    return (f'看图通道故障：{n_total} 页只认出 {n_ok} 页（{rate:.0%}）。'
+            '这不是 PDF 的问题，也不是你操作错了，重试同一份 PDF 也一样。'
+            '逐页错误（去重前 3 条）：' + (' ｜ '.join(uniq) if uniq else '（无错误详情）'))
 
 
 # ============================================================
@@ -178,8 +255,11 @@ CACHE_VER = 3   # 识别 prompt 变了就 bump；缓存 key 里带这个版本�
 
 
 def ingest(pdf_bytes: bytes, lesson_key: str, dist_dir: Path, on_log=None,
-           gallery_sub: str | None = None) -> dict:
-    """把 PDF 拆成每页 JPG + 提取印刷文字。图片字节直接放进返回值，不依赖磁盘。"""
+           gallery_sub: str | None = None, limit: int | None = None) -> dict:
+    """把 PDF 拆成每页 JPG + 提取印刷文字。图片字节直接放进返回值，不依赖磁盘。
+
+    limit：只处理前 N 页（自检用，只测一页通道，别把 60 页全渲染一遍）。
+    """
     import pymupdf  # PyMuPDF（懒加载）
     dist_dir = Path(dist_dir)
     if not gallery_sub:
@@ -201,6 +281,8 @@ def ingest(pdf_bytes: bytes, lesson_key: str, dist_dir: Path, on_log=None,
     doc = pymupdf.open(stream=pdf_bytes, filetype='pdf')
     pages = []
     for i, page in enumerate(doc):
+        if limit is not None and i >= limit:
+            break
         pix = page.get_pixmap(matrix=pymupdf.Matrix(RENDER_ZOOM, RENDER_ZOOM))
         jpg = pix.tobytes('jpeg', jpg_quality=JPEG_Q)
         fp = out_dir / f'p{i + 1:02d}.jpg'
@@ -549,24 +631,47 @@ def subject_cfg(subject: str | None) -> dict:
     return SUBJECTS.get((subject or 'math').strip().lower()) or SUBJECTS['math']
 
 
+def _pick_img(page: dict, mode: str = 'small') -> bytes:
+    """
+    挑哪张图发给模型。
+      small（默认）：ingest 做好的 1.0x 小图，约 30~50KB
+      tiny         ：再压到宽 790 / q62，约 15~25KB —— 补跑失败页用
+      big          ：1.5x 大图 —— tiny 也不行时最后一搏（字太密的小图会看不清）
+    """
+    if mode == 'big':
+        return page['img']
+    if mode == 'tiny':
+        return _shrink_jpg(page.get('img_small') or page['img'])
+    return page.get('img_small') or page['img']
+
+
 def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
-                subject: str = 'math') -> dict:
+                subject: str = 'math', mode: str = 'small',
+                model: str | None = None) -> dict:
     v = vision_cfg()
     if not v['key']:
         raise RuntimeError('看图模型未配置：需要 STUDY_VISION_API_KEY')
     SC = subject_cfg(subject)
+    use_model = model or v['model']
+    base_tokens = 700 if subject == 'math' else 1100
 
-    def _call():
+    def _call(nudge: bool = False):
         from openai import OpenAI
-        client = OpenAI(api_key=v['key'], base_url=v['base'] or None, timeout=180)
-        b64 = base64.b64encode(page.get('img_small') or page['img']).decode()
+        # max_retries=1：重试由 _retry 统一负责，别让 SDK 再悄悄放大请求量
+        client = OpenAI(api_key=v['key'], base_url=v['base'] or None, timeout=180,
+                        max_retries=1)
+        b64 = base64.b64encode(_pick_img(page, mode)).decode()
+        text = (SC.get('vision_prompt') or VISION_PROMPT).format(
+            course=course, no=no, title=title or '（未提供）')
+        if nudge:
+            # 上一轮模型回了空正文时用这句推它一把（某些网关对长图 + 长 prompt 会返回空）
+            text += '\n\n（上一轮你一个字都没输出。这次直接给出上面那个 JSON，不要空着、不要解释。）'
         resp = client.chat.completions.create(
-            model=v['model'],
+            model=use_model,
             messages=[
                 {'role': 'system', 'content': SC.get('vision_sys') or VISION_SYS},
                 {'role': 'user', 'content': [
-                    {'type': 'text', 'text': (SC.get('vision_prompt') or VISION_PROMPT).format(
-                        course=course, no=no, title=title or '（未提供）')},
+                    {'type': 'text', 'text': text},
                     {'type': 'image_url',
                      'image_url': {'url': f'data:image/jpeg;base64,{b64}'}},
                 ]},
@@ -574,14 +679,33 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
             temperature=0.1,
             # 语文/英语单页字多（一页能把整章考点压缩成一张表），700 tokens 会被截断，
             # 截断后 JSON 解析失败 → 整页作废。多给 400 换个稳。
-            max_tokens=700 if subject == 'math' else 1100,
+            max_tokens=base_tokens + (400 if nudge else 0),
         )
-        return resp.choices[0].message.content or ''
+        ch = resp.choices[0]
+        content = ch.message.content or ''
+        if not content.strip():
+            # 有的网关（含 Qwen 系）会把内容塞进 reasoning_content，正文留空
+            rc = getattr(ch.message, 'reasoning_content', None) or ''
+            if rc.strip():
+                content = rc
+        if not content.strip():
+            usage = getattr(resp, 'usage', None)
+            raise _EmptyAnswer(
+                f'第 {no} 页模型返回空内容（finish_reason={ch.finish_reason}，'
+                f'completion_tokens={getattr(usage, "completion_tokens", "?")}，'
+                f'model={getattr(resp, "model", use_model)}，图 {len(b64) * 3 // 4 // 1024}KB/{mode}）')
+        return content
 
-    raw = _retry(_call, tries=3, waits=(0, 3, 8), on_log=on_log)
+    try:
+        raw = _retry(lambda: _call(False), tries=2, waits=(0, 2), on_log=on_log)
+    except _EmptyAnswer:
+        if on_log:
+            on_log(f'  第 {no} 页空答，追加一句提示再试一次…')
+        raw = _call(True)
     data = extract_json(raw)
     if not isinstance(data, dict):
-        raise ValueError(f'第 {no} 页返回的不是 JSON：{raw[:80]}')
+        # 用 !r：空答/纯空白的正文，用普通字符串打出来是"看不见"的（踩过）
+        raise ValueError(f'第 {no} 页返回的不是 JSON：{raw[:80]!r}')
     return {
         'no': int(no),
         'role': str(data.get('role') or 'content').strip(),
@@ -596,8 +720,17 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
 
 
 def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
-                  on_progress=None, on_log=None, subject: str = 'math') -> dict:
-    """并发逐页看图。任何一页失败都不许静默跳过——记进 failed 列表返回。"""
+                  on_progress=None, on_log=None, subject: str = 'math',
+                  rescue: bool = True) -> dict:
+    """
+    并发逐页看图。任何一页失败都不许静默跳过——记进 failed 列表返回。
+
+    两遍走：
+      第一遍 并发（默认 6）——快；
+      第二遍 失败的页**单线程逐页补跑**（换 tiny 小图 → 再换 big 大图）。
+    第二遍为什么必须有：云端那次 41 页全挂，其中一部分其实只是并发抢接口/瞬时空答，
+    单线程重试就能过；而原来的代码 3 次重试都在并发里做完，失败了就永远丢掉这一页。
+    """
     results, failed = {}, []
     done = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
@@ -608,12 +741,66 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
             try:
                 results[no] = fut.result()
             except Exception as e:  # noqa: BLE001
-                failed.append({'page': no, 'error': str(e)[:200]})
+                failed.append({'page': no, 'error': err_text(e)})
                 if on_log:
-                    on_log(f'第 {no} 页看图失败：{str(e)[:100]}')
+                    on_log(f'第 {no} 页看图失败：{err_text(e, 120)}')
             done += 1
             if on_progress:
                 on_progress(done, len(pages), no)
+
+    def _rescue(f: dict) -> bool:
+        """
+        单线程救一页，最多三轮：
+          1) tiny 小图（最省 token，避开"请求太大"）
+          2) big 大图（小图看不清密密麻麻的板书时）
+          3) 换替补模型（主模型对这页就是吐空/认不出时）
+        救回来返回 True。
+        """
+        no, page, errs = f['page'], by_no[f['page']], []
+        v = vision_cfg()
+        alt = (v.get('fallback') or '').strip()
+        plans = [('tiny', None), ('big', None)]
+        if alt and alt != v['model']:
+            plans.append(('tiny', alt))
+        for mode, model in plans:
+            tag = mode if not model else f'{mode}+{model.split("/")[-1]}'
+            try:
+                results[no] = profile_one(page, course, str(no), title, on_log,
+                                          subject, mode=mode, model=model)
+                if on_log:
+                    on_log(f'  第 {no} 页补跑成功（{tag}）')
+                return True
+            except Exception as e:  # noqa: BLE001
+                errs.append(f'{tag}: {err_text(e, 120)}')
+                if on_log:
+                    on_log(f'  第 {no} 页补跑失败（{tag}）：{err_text(e, 100)}')
+        f['error'] = (f.get('error', '') + ' → ' + ' → '.join(errs))[:400]
+        return False
+
+    if rescue and failed:
+        by_no = {p['no']: p for p in pages}
+        ordered = sorted(failed, key=lambda x: x['page'])
+        # 大面积失败时先只探一页：接口本身不通的话，一页一页磨 40 分钟毫无意义；
+        # 但探通了就说明是「并发抢接口/瞬时空答」，这时候值得把剩下的全部单线程补跑。
+        probe_only = len(failed) / max(len(pages), 1) > 0.6
+        if on_log:
+            on_log(f'  补跑（单线程，换小图重试；'
+                   f'{"大面积失败，先探一页看接口通不通" if probe_only else f"共 {len(ordered)} 页"}）…')
+        first_ok = _rescue(ordered[0])
+        if probe_only and not first_ok:
+            if on_log:
+                on_log('  ⚠ 单线程补跑也不通 → 判定看图通道故障，不再逐页磨时间')
+            # failed 原样保留（含新追加的 tiny/big 错误），交给 vision_guard 说人话
+        else:
+            rest = ordered[1:]
+            if probe_only and on_log:
+                on_log(f'  单线程能通 → 剩下的 {len(rest)} 页接着补…')
+            failed = [f for f in rest if not _rescue(f)]
+            if on_log and failed:
+                on_log(f'  仍有 {len(failed)} 页没识别出来')
+    elif rescue:
+        failed = []
+
     out = [results[k] for k in sorted(results)]
     return {'pages': out, 'failed': failed}
 
@@ -1475,6 +1662,34 @@ def _cache_path(pdf_bytes: bytes, subject: str = 'math') -> Path:
     return d / (hashlib.sha256(pdf_bytes).hexdigest()[:16] + tail + f'-v{CACHE_VER}.json')
 
 
+def selfcheck(pdf_bytes: bytes, subject: str = 'math', course: str = '自检') -> dict:
+    """
+    只把 PDF 的第 1 页发给看图模型，验证「通道通不通」。
+    一次调用、约 10~30 秒，比等 41 页全跑完再失败划算得多（云端那次就是这么白等的）。
+
+    返回 {'ok', 'model', 'base', 'key_len', 'seconds', 'img_kb', 'content', 'error', 'page'}
+    """
+    v = vision_cfg()
+    out = {'ok': False, 'model': v['model'], 'base': v['base'], 'key_len': len(v['key']),
+           'seconds': 0.0, 'img_kb': 0, 'content': '', 'error': '', 'page': 1}
+    t0 = time.time()
+    try:
+        if not v['key']:
+            raise RuntimeError('看图模型没配：STUDY_VISION_API_KEY 是空的')
+        d = Path(tempfile.mkdtemp(prefix='notes_selfcheck_'))
+        ing = ingest(pdf_bytes, 'selfcheck', d, gallery_sub='_probe', limit=1)
+        p = ing['pages'][0]
+        out['img_kb'] = len(p['img_small']) // 1024
+        r = profile_one(p, course, '1', '自检', subject=subject)
+        out['ok'] = True
+        out['content'] = (f"role={r['role']} ｜ topic={r['topic'] or '（空）'} ｜ "
+                          f"要点 {len(r['points'])} 条")
+    except Exception as e:  # noqa: BLE001
+        out['error'] = err_text(e, 400)
+    out['seconds'] = round(time.time() - t0, 1)
+    return out
+
+
 def run(pdf_bytes: bytes, lesson_key: str, title: str, no: str, course: str,
         date: str, dist_dir: Path | None = None, workers: int = 6,
         on_log=None, on_progress=None, use_cache: bool = True,
@@ -1516,10 +1731,12 @@ def run(pdf_bytes: bytes, lesson_key: str, title: str, no: str, course: str,
         log(f'② 逐页看图理解（{ing["count"]} 页，{workers} 并发）…')
         pf = profile_pages(ing['pages'], course, title=title, workers=workers,
                            on_progress=on_progress, on_log=log, subject=subject)
-        if not pf['pages']:
-            raise RuntimeError('所有页面都识别失败，检查看图模型配置')
-        pages = pf['pages']
-        failed = pf['failed']
+        pages, failed = pf['pages'], pf['failed']
+        # 识别率太低就地停下来说清楚，不许拿半份骨架去跑断言、
+        # 最后给用户一句「断言没过，再点一次多数就好」——那是把接口故障说成手气问题。
+        _guard = vision_guard(len(pages), ing['count'], failed)
+        if _guard:
+            raise RuntimeError(_guard)
         try:
             cache.write_text(json.dumps({'pages': pages, 'failed': failed},
                                         ensure_ascii=False), encoding='utf-8')

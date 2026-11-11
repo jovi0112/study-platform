@@ -174,7 +174,70 @@ ok(r[0] is True or ('pymupdf' in r[1] or 'Secrets' in r[1]), f'ready() 返回人
 ts = N.token_status()      # 本地没配 STUDY_BACKUP_TOKEN 的环境变量时也不许崩
 ok(ts.get('ok') in (True, False), 'token_status() 不崩')
 
-# ============ 5. 结构断言：app.py 的 notes.xxx 调用 ⊆ 守卫名单 ============
+# ============ 5. 看图失败的处理（2026-11-11 线上 41 页只认出 2 页那次） ============
+# 事故回顾：云端 41 页里 39 页失败，日志显示「第 38 页看图失败：」后面什么都没有，
+# 最后停在「结构断言没过」，把接口故障说成了模型手气不好。下面几条就是钉这几处。
+print('--- 看图失败的处理 ---')
+ok(F.err_text(Exception()).startswith('Exception: '), '空异常也有类型名，不会只剩一个冒号')
+ok('Timeout' in F.err_text(TimeoutError()), '内置 TimeoutError（str 为空）也能显示类型')
+ok(F.err_text(ValueError('第 3 页返回的不是 JSON')) == 'ValueError: 第 3 页返回的不是 JSON',
+   '普通异常文本照原样带出来')
+src_f = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'notes_forge.py'),
+             encoding='utf-8').read()
+ok('{raw[:80]!r}' in src_f, '非 JSON 报错用 !r 打印，纯空白回复不会显示成空白')
+msg = F.vision_guard(2, 41, [{'error': 'TimeoutError: '}, {'error': 'TimeoutError: '},
+                             {'error': '_EmptyAnswer: 第 23 页模型返回空内容'}])
+ok(msg and '看图通道故障' in msg and '只认出 2 页' in msg, f'识别率 5% 触发人话: {(msg or "")[:30]}')
+ok('_EmptyAnswer' in msg and msg.count('TimeoutError') == 1, '错误去重后只列 3 条以内')
+ok(F.vision_guard(38, 41, []) is None, '识别率 93% 不拦（正常出几页失败可以接受）')
+ok(F.vision_guard(0, 0, []) is None, '总页数 0 不拦（避免除零）')
+
+calls = []
+
+
+def _fake_profile_one(page, course, no, title='', on_log=None, subject='math',
+                      mode='small', model=None):
+    calls.append((int(no), mode))
+    if mode == 'small':                       # 模拟"并发时挂"
+        raise F._EmptyAnswer(f'第 {no} 页模型返回空内容（finish_reason=stop）')
+    return {'no': int(no), 'role': 'content', 'belongs': 'this', 'topic': 't',
+            'examples': [], 'points': ['a'], 'handwriting': False, 'page_text': ''}
+
+
+_real_po = F.profile_one
+F.profile_one = _fake_profile_one
+try:
+    pg = [{'no': i, 'img': b'x', 'img_small': b'y', 'text': ''} for i in (1, 2, 3)]
+    out = F.profile_pages(pg, '课', title='t', workers=3)
+finally:
+    F.profile_one = _real_po
+ok(len(out['pages']) == 3 and not out['failed'],
+   f'并发全挂 → 单线程 tiny 补跑全救回（{len(out["pages"])} 页）')
+modes = [m for n, m in calls]
+ok(modes.count('small') == 3 and modes.count('tiny') == 3,
+   f'补跑用 tiny 小图，不是把原图再发一遍: {modes}')
+
+calls.clear()
+
+
+def _dead(page, course, no, title='', on_log=None, subject='math',
+          mode='small', model=None):
+    calls.append((int(no), mode))
+    raise TimeoutError()
+
+
+F.profile_one = _dead
+try:
+    pg = [{'no': i, 'img': b'x', 'img_small': b'y', 'text': ''} for i in range(1, 11)]
+    out2 = F.profile_pages(pg, '课', title='t', workers=4)
+finally:
+    F.profile_one = _real_po
+ok(len(calls) <= 14, f'10 页全挂时只补探 1 页（tiny→big→替补模型），总调用 {len(calls)} 次')
+ok(len(out2['failed']) == 10, '探路失败 → 10 页失败记录全部保留（不吞）')
+ok(all('TimeoutError' in f['error'] for f in out2['failed']), '每个失败页都带异常类型')
+ok(len(F._shrink_jpg(b'not-a-jpeg')) == len(b'not-a-jpeg'), '坏图原样返回，压图不抛异常')
+
+# ============ 6. 结构断言：app.py 的 notes.xxx 调用 ⊆ 守卫名单 ============
 # 名单式自检天生会漏（scan 的 box_ratio 实测漏过），所以用源码扫描兜底：
 # 只要 app.py 里调了名单外的 notes 函数，这里立刻红。
 import re as _re

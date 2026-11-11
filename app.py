@@ -213,8 +213,9 @@ HAS_SHEET_CROP = not _MISSING_SCAN and not _STALE_MODS
 # ---- notes 模块自检（笔记工坊。同一条铁律：新界面 + 旧进程内存 = AttributeError）----
 _NOTES_NEED = ('ready', 'token_status', 'generate', 'list_lessons', 'load_lesson',
                'page_image', 'render_lesson', 'lesson_key_for', 'gallery_sub_for',
-               'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int')
-_NOTES_WANT = 1     # 要求 notes.MODULE_VER >= 1
+               'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int',
+               'selfcheck', 'vision_status')
+_NOTES_WANT = 2     # 要求 notes.MODULE_VER >= 2（v2 加了看图自检）
 
 
 def _notes_missing():
@@ -2269,6 +2270,29 @@ elif page == '🗒️ 笔记工坊':
         st.caption('一讲 50~60 页约需 4~8 分钟（逐页看图）。期间别关页面；'
                    '生成完自动存档，断言不过就不会写进仓库（宁可不出，不出错的）。')
 
+        # 看图通道自检：先花 1 次调用探一页，比等 41 页全跑完再报错划算得多。
+        _vs = notes.vision_status()
+        st.caption(f"看图模型：`{_vs['model']}` ｜ 接口：`{_vs['base']}` ｜ "
+                   f"密钥：{_vs['key']}（{_vs['key_len']} 位）")
+        if st.button('🔍 先测看图通道（只花 1 次调用，约 10~30 秒）',
+                     disabled=not up, key='nt_probe',
+                     help='只把第 1 页发给看图模型。通了再生成，省得白等十几分钟。'):
+            with st.spinner('测第 1 页…'):
+                try:
+                    _sc = notes.selfcheck(up.read(), _SUBJ_CODE[subj])
+                except Exception as _e:  # noqa: BLE001
+                    _sc = {'ok': False, 'error': f'{type(_e).__name__}: {_e}',
+                           'model': _vs['model'], 'base': _vs['base'],
+                           'key_len': _vs['key_len'], 'seconds': 0}
+            if _sc.get('ok'):
+                st.success(f"✅ 通道正常：{_sc['seconds']} 秒认出第 1 页"
+                           f"（图 {_sc.get('img_kb', '?')} KB）→ {_sc.get('content', '')}")
+            else:
+                st.error(f"❌ 通道不通：{_sc.get('error')}")
+                st.caption(f"用的 {_sc.get('model')} @ {_sc.get('base')}，"
+                           f"密钥 {_sc.get('key_len')} 位。"
+                           '这句话本身就是诊断依据——把这一行内容发我就能定位。')
+
         if st.button('🚀 开始生成', type='primary', disabled=not up, key='nt_go'):
             if not (title or '').strip():
                 st.error('先填标题 —— 逐页识别、骨架和讲解都靠它对准主题。')
@@ -2293,7 +2317,11 @@ elif page == '🗒️ 笔记工坊':
                                               title.strip(), on_log=_log, on_progress=_pr)
                     except Exception as e:  # noqa: BLE001
                         _res = None
-                        st.error(f'生成中断：{e}')
+                        st.error(f'中断：{type(e).__name__}: {e}')
+                        if '看图通道' in str(e):
+                            st.info('是**看图接口**的问题，不是这份 PDF、也不是你的操作。'
+                                    '先点上面那个「🔍 先测看图通道」，把那一行的报错发我；'
+                                    '重复点「开始生成」不会有不同结果，只会多花钱。')
                         _stat.update(label='❌ 中断', state='error')
                     if _res and _res.get('ok'):
                         _stat.update(label='✅ 完成', state='complete', expanded=False)
