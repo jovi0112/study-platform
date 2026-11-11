@@ -216,8 +216,8 @@ _NOTES_NEED = ('ready', 'token_status', 'generate', 'list_lessons', 'load_lesson
                'page_image', 'render_lesson', 'lesson_key_for', 'gallery_sub_for',
                'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int',
                'selfcheck', 'vision_status')
-_NOTES_WANT = 5     # 要求 notes.MODULE_VER >= 5（bump 它 = 逼 app 重新加载 notes→notes_forge）
-# v5 = 带上 notes_forge v4：worker 线程不碰 st（NoSessionContext 根因）、429 真退避、截断 JSON 抢救
+_NOTES_WANT = 6     # 要求 notes.MODULE_VER >= 6（bump 它 = 逼 app 重新加载 notes→notes_forge）
+# v6 = 带上 notes_forge v5：worker 线程不碰 st、429 真退避、截断 JSON 抢救、智谱系串行节流
 
 
 def _notes_missing():

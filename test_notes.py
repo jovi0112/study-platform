@@ -304,7 +304,12 @@ finally:
 
 # 5.7 并发按服务商定；补跑有总时长上限；探路页不许被吞
 os.environ['STUDY_VISION_BASE_URL'] = 'https://open.bigmodel.cn/api/paas/v4'
-ok(F.default_workers() == 2, f'智谱地址默认 2 并发（flash 门限紧）: {F.default_workers()}')
+ok(F.default_workers() == 1,
+   f'智谱地址默认串行 1 并发（2 并发就撞账号 QPS，41 页里 24 页作废）: {F.default_workers()}')
+ok(abs(F.page_gap() - 1.0) < 1e-6, f'智谱系页间节流默认 1 秒: {F.page_gap()}')
+os.environ['STUDY_VISION_GAP'] = '2.5'
+ok(abs(F.page_gap() - 2.5) < 1e-6, 'STUDY_VISION_GAP 可覆盖节流间隔')
+os.environ.pop('STUDY_VISION_GAP', None)
 os.environ['STUDY_VISION_BASE_URL'] = 'https://api.siliconflow.cn/v1'
 ok(F.default_workers() == 4, f'其它厂商默认 4 并发: {F.default_workers()}')
 os.environ['STUDY_VISION_WORKERS'] = '3'
@@ -377,6 +382,14 @@ _r3 = F.extract_json('{"role":"content","topic":"半截字符串')
 ok(isinstance(_r3, dict) and _r3.get('topic') == '半截字符串', f'截断在字符串中间 → 补引号: {_r3}')
 ok(F.extract_json('完全不是 JSON 的一段话') is None, '真不是 JSON 就返回 None（不假装成功）')
 ok(F._repair_json('{"a":1}}') is None, '括号交错时不硬猜（返回 None，宁可报错）')
+# 裸换行：glm 抄板书时 page_text 里带真换行 → json.loads 报 Invalid control character
+_nl = '```json\n{"role":"content","topic":"等式","page_text":"第一行\n第二行"}\n```'
+_r4 = F.extract_json(_nl)
+ok(isinstance(_r4, dict) and _r4.get('page_text') == '第一行\n第二行',
+   f'字符串里的裸换行也能救（转义后仍是原换行）: {_r4}')
+# 结尾孤立反斜杠：补的引号会被它吃掉
+_r5 = F.extract_json('{"role":"content","topic":"abc\\')
+ok(isinstance(_r5, dict), f'结尾孤立反斜杠 → 丢掉再补引号: {_r5}')
 
 # 7.2 429 真退避：_retry 要按异常类型选等待计划
 _slept, _logged = [], []

@@ -36,14 +36,15 @@ except Exception:
 # pymupdf 是懒加载的：import 本模块不需要装它，只有真正跑 ingest 才 import。
 # 这样"笔记工坊"页面在依赖没装好时也能给出人话提示，而不是整站崩。
 
-# MODULE_VER = 4：2026-11-11 第三轮线上实录（智谱 glm-4.6v-flash）三个修复：
+# MODULE_VER = 5：2026-11-11 四轮线上实录（智谱 glm-4.6v-flash）的修复：
 #   ① worker 线程的 on_log 必须先进缓冲、主线程统一 flush——
 #      app.py 的 _log 回调碰 st 容器，在 ThreadPoolExecutor 线程里直接抛
 #      NoSessionContext，37/41 页全部死于"日志回调"而不是看图本身（单线程补跑全过）；
-#   ② 429 限流要真等：flash 免费模型整场都在 429，秒级重试毫无意义；
-#   ③ 截断 JSON 抢救：glm 把 JSON 用 ```json 围栏包住且尾部被 max_tokens 咬掉，
-#      之前整页作废（6 页其实内容是好的）。
-MODULE_VER = 4
+#   ② 429 限流要真等：flash 免费模型整场都在 429（含「您的账户已达到速率限制」=账号级 QPS）；
+#   ③ 截断/裸换行 JSON 抢救：glm 的回复被 ```json 围栏 + max_tokens 咬掉尾部，
+#      字符串里还常带真换行，之前整页作废；
+#   ④ 智谱系默认串行（1 并发）+ 页间节流 1 秒——2 并发就撞账号 QPS，41 页里 24 页作废。
+MODULE_VER = 5
 
 # ============================================================
 # 配置（与 llm.py 同一套键：STUDY_LLM_* / STUDY_VISION_*，
@@ -97,13 +98,27 @@ def default_workers() -> int:
     嫌慢可以在 secrets 里设 STUDY_VISION_WORKERS（1~8）自己调，不用改代码。
     """
     base = (vision_cfg().get('base') or '').lower()
-    # 智谱 flash 的并发门限明显更紧（线上 4 路时大面积失败 → 补跑也救不回来）
-    hard = 2 if ('bigmodel' in base or 'zhipu' in base) else 4
+    # 智谱 flash 的并发门限明显更紧。2026-11-11 第四轮线上实测 2 并发时
+    # 还会撞上「您的账户已达到速率限制，请您控制请求频率」（账号级 QPS，不只是模型排队），
+    # 41 页里 24 页失败、补跑也来不及 → 直接串行（1），靠页间节流把 QPS 压到配额内。
+    hard = 1 if ('bigmodel' in base or 'zhipu' in base) else 4
     try:
         n = int(cfg('STUDY_VISION_WORKERS', str(hard)) or hard)
     except Exception:  # noqa: BLE001
         n = hard
     return max(1, min(8, n))
+
+
+def page_gap() -> float:
+    """
+    页与页之间的间隔（秒）。串行 + 间隔是账号级 QPS 限制的正解：
+    实测 2 并发时智谱回「您的账户已达到速率限制」，1 并发 + 1 秒间隔几乎不触发。
+    41 页 × (调用 6~10s + 1s) ≈ 5~8 分钟，用户预期是「50 页约 48 分钟」，完全够用。
+    """
+    try:
+        return max(0.0, float(cfg('STUDY_VISION_GAP', '1.0') or 1.0))
+    except Exception:  # noqa: BLE001
+        return 1.0
 
 
 def cfg_status() -> dict:
@@ -124,37 +139,57 @@ def cfg_status() -> dict:
 
 def _repair_json(s: str):
     """
-    修被 max_tokens 截断的 JSON：补齐没闭合的引号 / 括号、去掉尾逗号。
-    2026-11-11 线上实录：glm-4.6v-flash 的回复被截断（尾部缺 }），
-    原来的"剥围栏 + 硬抠首尾"全部 loads 失败，6 页内容明明是好的整页作废。
-    修不好返回 None（不假装成功）。
+    修被 max_tokens 截断 / 带非法字符的 JSON：补引号括号、去尾逗号、
+    把字符串里的裸换行/控制字符转义、丢掉结尾孤立的反斜杠。
+    2026-11-11 线上实录：glm-4.6v-flash 的回复有两种坏法——
+      · 尾部缺 }（截断）
+      · 字符串里带真换行（page_text 抄板书时）→ json.loads 直接报 Invalid control character
+    原来这两种都整页作废（内容明明是好的）。修不好返回 None（不假装成功）。
     """
-    t = re.sub(r',\s*([}\]])', r'\1', s)          # 尾逗号
-    stack, in_str, esc = [], False, False
+    t = s.strip()
+    t = re.sub(r'^```(?:json)?\s*', '', t)
+    t = re.sub(r'\s*```$', '', t)
+    t = re.sub(r',\s*([}\]])', r'\1', t)          # 尾逗号
+    out, stack, in_str, esc = [], [], False, False
     for ch in t:
         if in_str:
             if esc:
+                out.append(ch)
                 esc = False
             elif ch == '\\':
+                out.append(ch)
                 esc = True
             elif ch == '"':
+                out.append(ch)
                 in_str = False
+            elif ch == '\n':
+                out.append('\\n')                  # 裸换行 → 转义
+            elif ch == '\r':
+                out.append('\\r')
+            elif ch == '\t':
+                out.append('\\t')
+            elif ord(ch) < 0x20:
+                out.append('\\u%04x' % ord(ch))
+            else:
+                out.append(ch)
             continue
         if ch == '"':
             in_str = True
         elif ch in '{[':
             stack.append('}' if ch == '{' else ']')
         elif ch in '}]':
-            if stack and stack[-1] == ch:
-                stack.pop()
-            else:
+            if not (stack and stack[-1] == ch):
                 return None                        # 括号交错，救不了
+            stack.pop()
+        out.append(ch)
+    if esc and out and out[-1] == '\\':
+        out.pop()                                  # 结尾孤立反斜杠会吃掉补的引号
     if in_str:
-        t += '"'                                   # 截断在字符串中间 → 补引号
+        out.append('"')                            # 截断在字符串中间 → 补引号
     while stack:
-        t += stack.pop()                           # 截断在嵌套中间 → 补括号
+        out.append(stack.pop())                    # 截断在嵌套中间 → 补括号
     try:
-        return json.loads(t)
+        return json.loads(''.join(out))
     except Exception:
         return None
 
@@ -835,8 +870,10 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
         raw = _call(True)
     data = extract_json(raw)
     if not isinstance(data, dict):
-        # 用 !r：空答/纯空白的正文，用普通字符串打出来是"看不见"的（踩过）
-        raise ValueError(f'第 {no} 页返回的不是 JSON：{raw[:80]!r}')
+        # 用 !r：空答/纯空白的正文，用普通字符串打出来是"看不见"的（踩过）。
+        # 头尾都打：头看是什么格式，尾看是不是被截断（截断的话抢救逻辑会先跑一遍）。
+        raise ValueError(f'第 {no} 页返回的不是 JSON（{len(raw)} 字）：'
+                         f'{raw[:80]!r} … 结尾 {raw[-40:]!r}')
     return {
         'no': int(no),
         'role': str(data.get('role') or 'content').strip(),
@@ -877,6 +914,9 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
             buf: list = []
             bufs[p['no']] = buf
             sink = (lambda s, _b=buf: _b.append(s)) if on_log else None
+            # 串行时按配额节流：不加间隔的话，1 并发也会连续打满 RPM
+            if workers <= 1:
+                time.sleep(page_gap())
             # 主并发的限流退避短一些（真等交给单线程补跑），免得 41 页各睡 20 秒
             futs[ex.submit(lambda _p=p, _s=sink: profile_one(
                 _p, course, str(_p['no']), title, _s, subject,
