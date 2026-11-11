@@ -36,6 +36,12 @@ except Exception:
 # pymupdf 是懒加载的：import 本模块不需要装它，只有真正跑 ingest 才 import。
 # 这样"笔记工坊"页面在依赖没装好时也能给出人话提示，而不是整站崩。
 
+# 版本号：改对外接口（run / selfcheck / profile_* / cfg_status）必须 bump。
+# 2026-11-11 踩过的坑：notes.py 自己 reload 了，notes_forge 没人 reload，
+# 新按钮点下去报「module 'notes_forge' has no attribute 'selfcheck'」——
+# 名单式守卫又漏一项。所以这里给版本号，由 notes._forge() 负责比对 + reload。
+MODULE_VER = 2
+
 # ============================================================
 # 配置（与 llm.py 同一套键：STUDY_LLM_* / STUDY_VISION_*，
 # 本地走 .streamlit/secrets.toml，云端走 Cloud Secrets）
@@ -645,6 +651,23 @@ def _pick_img(page: dict, mode: str = 'small') -> bytes:
     return page.get('img_small') or page['img']
 
 
+def _is_bad_request(e: BaseException) -> bool:
+    """400/422 之类「参数不被接受」——换一套参数还有救，不是接口坏了。"""
+    code = getattr(e, 'status_code', None)
+    if code is None:
+        code = getattr(getattr(e, 'response', None), 'status_code', None)
+    return code in (400, 404, 422) or 'badrequest' in type(e).__name__.lower()
+
+
+def _img_url(b64: str, style: str) -> str:
+    """
+    data URL 还是裸 base64。
+    智谱（bigmodel）的官方示例是**裸 base64**，带 data: 前缀有的版本直接 400；
+    而 OpenAI 系/SiliconFlow 必须是 data URL。两边都不能假设，只能试。
+    """
+    return b64 if style == 'raw' else f'data:image/jpeg;base64,{b64}'
+
+
 def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
                 subject: str = 'math', mode: str = 'small',
                 model: str | None = None) -> dict:
@@ -653,48 +676,80 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
         raise RuntimeError('看图模型未配置：需要 STUDY_VISION_API_KEY')
     SC = subject_cfg(subject)
     use_model = model or v['model']
-    base_tokens = 700 if subject == 'math' else 1100
+    # 原来数学只给 700。2026-11-11 线上实录：云端配的是 glm-4.6v-flash（带思考），
+    # 700 tokens 被思考吃光 → 正文空字符串 → 整页作废 39/41 页。给足，并显式关思考。
+    base_tokens = 1200 if subject == 'math' else 1600
 
-    def _call(nudge: bool = False):
+    def _ask(b64: str, style: str, tokens: int, think_off: bool, nudge: bool):
         from openai import OpenAI
-        # max_retries=1：重试由 _retry 统一负责，别让 SDK 再悄悄放大请求量
+        # max_retries=1：重试由外层统一负责，别让 SDK 再悄悄放大请求量
         client = OpenAI(api_key=v['key'], base_url=v['base'] or None, timeout=180,
                         max_retries=1)
-        b64 = base64.b64encode(_pick_img(page, mode)).decode()
         text = (SC.get('vision_prompt') or VISION_PROMPT).format(
             course=course, no=no, title=title or '（未提供）')
         if nudge:
-            # 上一轮模型回了空正文时用这句推它一把（某些网关对长图 + 长 prompt 会返回空）
             text += '\n\n（上一轮你一个字都没输出。这次直接给出上面那个 JSON，不要空着、不要解释。）'
-        resp = client.chat.completions.create(
+        kw = dict(
             model=use_model,
             messages=[
                 {'role': 'system', 'content': SC.get('vision_sys') or VISION_SYS},
                 {'role': 'user', 'content': [
                     {'type': 'text', 'text': text},
-                    {'type': 'image_url',
-                     'image_url': {'url': f'data:image/jpeg;base64,{b64}'}},
+                    {'type': 'image_url', 'image_url': {'url': _img_url(b64, style)}},
                 ]},
             ],
             temperature=0.1,
-            # 语文/英语单页字多（一页能把整章考点压缩成一张表），700 tokens 会被截断，
-            # 截断后 JSON 解析失败 → 整页作废。多给 400 换个稳。
-            max_tokens=base_tokens + (400 if nudge else 0),
+            max_tokens=tokens,
         )
-        ch = resp.choices[0]
-        content = ch.message.content or ''
-        if not content.strip():
-            # 有的网关（含 Qwen 系）会把内容塞进 reasoning_content，正文留空
-            rc = getattr(ch.message, 'reasoning_content', None) or ''
-            if rc.strip():
-                content = rc
-        if not content.strip():
-            usage = getattr(resp, 'usage', None)
-            raise _EmptyAnswer(
-                f'第 {no} 页模型返回空内容（finish_reason={ch.finish_reason}，'
-                f'completion_tokens={getattr(usage, "completion_tokens", "?")}，'
-                f'model={getattr(resp, "model", use_model)}，图 {len(b64) * 3 // 4 // 1024}KB/{mode}）')
-        return content
+        if think_off:
+            # 智谱 GLM-4.5V 起默认开思考；思考 token 会挤掉正文。不支持该参数的服务会 400，
+            # 由下面的循环自动退到"不传"。对没有思考的模型（Qwen-VL）这是无害的。
+            kw['extra_body'] = {'thinking': {'type': 'disabled'}}
+        return client.chat.completions.create(**kw)
+
+    def _call(nudge: bool = False) -> str:
+        base = v['base'] or ''
+        # 智谱优先裸 base64（官方口径），其它先 data URL；两种都试得到
+        styles = ['raw', 'dataurl'] if ('bigmodel' in base or 'zhipu' in base) \
+            else ['dataurl', 'raw']
+        b64 = base64.b64encode(_pick_img(page, mode)).decode()
+        last: BaseException | None = None
+        tries = 0
+        for style in styles:
+            think_off, tokens = True, base_tokens
+            while tries < 4:
+                tries += 1
+                try:
+                    resp = _ask(b64, style, tokens, think_off, nudge)
+                except Exception as e:  # noqa: BLE001
+                    last = e
+                    if _is_bad_request(e):
+                        if think_off:
+                            think_off = False        # 不认 thinking 参数 → 去掉再试
+                            continue
+                        break                        # 这套 style 也不行 → 换下一套
+                    raise
+                ch = resp.choices[0]
+                content = ch.message.content or ''
+                if not content.strip():
+                    # 有的网关把内容塞进 reasoning_content，正文留空
+                    rc = getattr(ch.message, 'reasoning_content', None) or ''
+                    if rc.strip():
+                        content = rc
+                if content.strip():
+                    return content
+                usage = getattr(resp, 'usage', None)
+                last = _EmptyAnswer(
+                    f'第 {no} 页模型返回空内容（finish_reason={ch.finish_reason}，'
+                    f'completion_tokens={getattr(usage, "completion_tokens", "?")}，'
+                    f'max_tokens={tokens}，model={getattr(resp, "model", use_model)}，'
+                    f'图 {len(b64) * 3 // 4 // 1024}KB/{mode}，{style}'
+                    f'{"，thinking=off" if think_off is False else ""}）')
+                if ch.finish_reason == 'length':
+                    tokens = int(tokens * 2.5)       # 被截断 → 加大预算再试
+                    continue
+                break                                # 空但不是截断 → 换 style / 图
+        raise last or _EmptyAnswer(f'第 {no} 页模型返回空内容')
 
     try:
         raw = _retry(lambda: _call(False), tries=2, waits=(0, 2), on_log=on_log)

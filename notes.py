@@ -40,11 +40,17 @@ SUBJECT_LABEL = {'math': '数学', 'chinese': '语文', 'english': '英语'}
 # ============================================================
 
 def ready() -> tuple[bool, str]:
-    """三件事都齐才能开工：pymupdf 已装、看图 key、文本 key。缺什么说什么。"""
+    """三件事都齐才能开工：pymupdf 已装、forgy 版本够新、看图和文本 key 都在。"""
     try:
         import pymupdf  # noqa: F401
     except Exception:
         return False, '缺少 PDF 渲染依赖 pymupdf —— 等 Streamlit Cloud 把 requirements.txt 装完（构建要几分钟），刷新即可'
+    f = _forge()
+    _ver = int(getattr(f, 'MODULE_VER', 0) or 0)
+    if _ver < _FORGE_WANT:
+        return False, (f'内存里跑的还是旧 notes_forge 模块（v{_ver}，这里要 v{_FORGE_WANT}）。'
+                       '线上：右下角 **Manage app → Reboot app**；本地：重启 streamlit。'
+                       '（不是你的操作问题，新代码已经在磁盘上了，只是进程没重新加载。）')
     c = _forge().cfg_status()
     if not c['vision_ready']:
         return False, '看图模型未配置（缺 STUDY_VISION_API_KEY）——在 Cloud 的 Settings → Secrets 里补'
@@ -53,8 +59,24 @@ def ready() -> tuple[bool, str]:
     return True, ''
 
 
+_FORGE_WANT = 2     # 要求 notes_forge.MODULE_VER >= 2（v2 加了 selfcheck + 看图适配）
+
+
 def _forge():
+    """
+    拿 notes_forge 模块，并保证它是**磁盘上的新版本**。
+    2026-11-11 线上实录：notes.py 自己 reload 过了，但 notes_forge 没人 reload，
+    新按钮一点就报「module 'notes_forge' has no attribute 'selfcheck'」。
+    这里比对版本号，旧的就地 reload —— 和 app.py 对 llm/scan/notes 用的是同一条铁律。
+    """
+    import importlib
+
     import notes_forge
+    if int(getattr(notes_forge, 'MODULE_VER', 0) or 0) < _FORGE_WANT:
+        try:
+            importlib.reload(notes_forge)
+        except Exception:  # noqa: BLE001
+            pass
     return notes_forge
 
 

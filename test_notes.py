@@ -237,7 +237,72 @@ ok(len(out2['failed']) == 10, '探路失败 → 10 页失败记录全部保留�
 ok(all('TimeoutError' in f['error'] for f in out2['failed']), '每个失败页都带异常类型')
 ok(len(F._shrink_jpg(b'not-a-jpeg')) == len(b'not-a-jpeg'), '坏图原样返回，压图不抛异常')
 
-# ============ 6. 结构断言：app.py 的 notes.xxx 调用 ⊆ 守卫名单 ============
+# ============ 6. 云端真实根因（智谱 glm-4.6v-flash）：思考吃光 token + 图片格式 ============
+# 2026-11-11 线上实测：云端配的是 glm-4.6v-flash @ open.bigmodel.cn，不是本地那套 Qwen。
+# 该模型默认开思考，只给 700 tokens → 正文空字符串 → 39/41 页作废。下面几条钉住适配逻辑。
+print('--- 云端看图模型适配 ---')
+ok(F._img_url('AAA', 'raw') == 'AAA', 'raw 风格发裸 base64（智谱口径）')
+ok(F._img_url('AAA', 'dataurl').startswith('data:image/jpeg;base64,'), 'dataurl 风格带前缀（OpenAI/SiliconFlow 口径）')
+
+
+class _E400(Exception):
+    status_code = 400
+
+
+ok(F._is_bad_request(_E400('bad')), '400 认成"参数不被接受"')
+ok(not F._is_bad_request(TimeoutError()), '超时不算参数问题（不许降级成换参数）')
+
+import types as _types
+import openai as _openai
+
+calls4 = []
+
+
+class _FakeCompletions:
+    def __init__(self, script):
+        self.script = script
+
+    def create(self, **kw):
+        calls4.append(kw)
+        step = self.script.pop(0) if self.script else ('json', 'stop')
+        kind, finish = step
+        if kind == 'raise400':
+            raise _E400('unknown field: thinking')
+        content = '' if kind == 'empty' else '{"role":"content","topic":"去分母","points":["a"]}'
+        msg = _types.SimpleNamespace(content=content, reasoning_content=None)
+        return _types.SimpleNamespace(choices=[_types.SimpleNamespace(message=msg, finish_reason=finish)],
+                                      usage=_types.SimpleNamespace(completion_tokens=42), model='fake')
+
+
+class _FakeOpenAI:
+    def __init__(self, script):
+        self.chat = _types.SimpleNamespace(completions=_FakeCompletions(script))
+
+
+_real_openai = _openai.OpenAI
+_page = {'no': 3, 'img': b'x' * 100, 'img_small': b'y' * 80, 'text': ''}
+try:
+    # 场景 A：带 thinking 参数被 400 → 去掉再问 → 空且 length → 加倍 tokens → 终于出 JSON
+    _script = [('raise400', 'stop'), ('empty', 'length'), ('json', 'stop')]
+    _openai.OpenAI = lambda **kw: _FakeOpenAI(_script)
+    r = F.profile_one(_page, '一元一次方程', '3', 't', subject='math')
+    ok(r['topic'] == '去分母', '被 400 → 空答截断 → 加大预算，三步内拿到结果')
+    ok('extra_body' in calls4[0] and 'extra_body' not in calls4[1], '第一次带 thinking=disabled，400 后自动去掉')
+    ok(calls4[2]['max_tokens'] > calls4[1]['max_tokens'], '截断后 max_tokens 真的加大了')
+    ok(calls4[2]['max_tokens'] >= 1200, f'数学基础预算 ≥1200（原来是 700，被思考吃光）: {calls4[2]["max_tokens"]}')
+
+    # 场景 B：智谱地址 → 先发裸 base64
+    calls4.clear()
+    os.environ['STUDY_VISION_BASE_URL'] = 'https://open.bigmodel.cn/api/paas/v4'
+    _openai.OpenAI = lambda **kw: _FakeOpenAI([('json', 'stop')])
+    F.profile_one(_page, '一元一次方程', '4', 't', subject='math')
+    url0 = calls4[0]['messages'][1]['content'][1]['image_url']['url']
+    ok(not url0.startswith('data:'), f'智谱地址先发裸 base64: {url0[:16]}…')
+finally:
+    _openai.OpenAI = _real_openai
+    os.environ.pop('STUDY_VISION_BASE_URL', None)
+
+# ============ 7. 结构断言：app.py 的 notes.xxx 调用 ⊆ 守卫名单 ============
 # 名单式自检天生会漏（scan 的 box_ratio 实测漏过），所以用源码扫描兜底：
 # 只要 app.py 里调了名单外的 notes 函数，这里立刻红。
 import re as _re
@@ -252,5 +317,9 @@ missing_in_list = called - need
 ok(not missing_in_list,
    f'app.py 的 notes 调用都在守卫名单里（漏了: {missing_in_list}）')
 ok(N.MODULE_VER >= 1, 'notes.MODULE_VER 存在（版本号兜底层）')
+ok(int(getattr(N, '_FORGE_WANT', 0)) <= int(getattr(F, 'MODULE_VER', 0)),
+   f'notes._FORGE_WANT({getattr(N, "_FORGE_WANT", "?")}) ≤ notes_forge.MODULE_VER({getattr(F, "MODULE_VER", "?")})'
+   ' —— 否则线上会一直判"模块太旧"，页面进不去')
+ok(int(getattr(F, 'MODULE_VER', 0)) >= 2, 'notes_forge 有版本号（selfcheck 那次没 reload 就是因为没有它）')
 
 print(f'\nALL NOTES CHECKS OK ({PASS} 项)')
