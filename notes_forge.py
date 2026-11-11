@@ -44,7 +44,17 @@ except Exception:
 #   ③ 截断/裸换行 JSON 抢救：glm 的回复被 ```json 围栏 + max_tokens 咬掉尾部，
 #      字符串里还常带真换行，之前整页作废；
 #   ④ 智谱系默认串行（1 并发）+ 页间节流 1 秒——2 并发就撞账号 QPS，41 页里 24 页作废。
-MODULE_VER = 5
+#
+# MODULE_VER = 6：2026-11-11 晚「卡死了」（用户原话）——串行把 41 页拖到 8.4 分钟，
+#   6.7MB 的整训期讲义 60~70 页要 15~20 分钟，而页面上只在「页完成」时才动一下，
+#   用户没法判断是在跑还是死了。这一版把"慢"变成"看得见的慢、能停、能续"：
+#   ⑤ pdf_pages / pdf_info：上传后立刻算页数与预计时长（不渲染，<100ms）；
+#   ⑥ ingest 逐 10 页报一次渲染进度（原来整段静默）；
+#   ⑦ profile_pages 每页一行心跳（页号 + 已用 + 预计还需），单页超时 90→70 秒；
+#   ⑧ 逐页增量缓存：每页识别成功即落盘，中断/关页面/超时后再点，只补没成功的页；
+#   ⑨ 总时间上限 STUDY_TOTAL_BUDGET（默认 1500 秒）：到点主动停，把没跑的页
+#      明确列为"超过总时间上限未处理"，不无限挂着——配合 ⑧ 可以直接续跑。
+MODULE_VER = 6
 
 # ============================================================
 # 配置（与 llm.py 同一套键：STUDY_LLM_* / STUDY_VISION_*，
@@ -360,6 +370,44 @@ JPEG_Q = 72
 CACHE_VER = 3   # 识别 prompt 变了就 bump；缓存 key 里带这个版本号
 
 
+def pdf_pages(pdf_bytes: bytes) -> int:
+    """只数页数，不渲染（PyMuPDF 读目录，几十毫秒）。"""
+    import pymupdf  # PyMuPDF（懒加载）
+    doc = pymupdf.open(stream=pdf_bytes, filetype='pdf')
+    try:
+        return int(doc.page_count)
+    finally:
+        try:
+            doc.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# 每页实测耗时（秒）。2026-11-11 线上 41 页整讲实测：② 阶段 8.4 分钟 → 12.3 秒/页
+# （含页间节流 1 秒、失败重试与补跑）。别凭感觉写 3 秒/页，用户会按它安排时间。
+PER_PAGE_SEC = 12.5
+# 识别完之后还有 ③骨架 ④例题 ⑤自测/雷区 ⑥自检 ⑦断言 ⑧存档，实测 2~5 分钟。
+TAIL_SEC = 180
+
+
+def estimate_minutes(pages: int, workers: int | None = None) -> tuple[float, float]:
+    """(最快, 最慢) 分钟。串行就按 12.5 秒/页给实数，不粉饰。"""
+    w = max(1, workers if workers is not None else default_workers())
+    per = PER_PAGE_SEC / w if w <= 1 else PER_PAGE_SEC / w * 0.75  # 并发收益打七五折
+    fast = (pages * per * 0.8 + TAIL_SEC) / 60
+    slow = (pages * per * 1.6 + TAIL_SEC * 1.5) / 60
+    return round(fast, 1), round(slow, 1)
+
+
+def pdf_info(pdf_bytes: bytes, workers: int | None = None) -> dict:
+    """上传后立刻能给用户看的实话：几页、大概要多久。不渲染、不调模型。"""
+    n = pdf_pages(pdf_bytes)
+    fast, slow = estimate_minutes(n, workers)
+    return {'pages': n, 'fast_min': fast, 'slow_min': slow,
+            'workers': max(1, workers if workers is not None else default_workers()),
+            'size_kb': len(pdf_bytes) // 1024}
+
+
 def ingest(pdf_bytes: bytes, lesson_key: str, dist_dir: Path, on_log=None,
            gallery_sub: str | None = None, limit: int | None = None) -> dict:
     """把 PDF 拆成每页 JPG + 提取印刷文字。图片字节直接放进返回值，不依赖磁盘。
@@ -385,6 +433,10 @@ def ingest(pdf_bytes: bytes, lesson_key: str, dist_dir: Path, on_log=None,
         on_log(f'  ⚠ 有 {len(stale)} 张旧图没删掉（环境不允许删除），同名图会被覆盖')
 
     doc = pymupdf.open(stream=pdf_bytes, filetype='pdf')
+    n_total = doc.page_count
+    if on_log:
+        on_log(f'   共 {n_total} 页，开始渲染（每 10 页报一次，渲染不花钱、不走网络）…')
+    t_render = time.time()
     pages = []
     for i, page in enumerate(doc):
         if limit is not None and i >= limit:
@@ -402,6 +454,9 @@ def ingest(pdf_bytes: bytes, lesson_key: str, dist_dir: Path, on_log=None,
             'img': jpg,
             'img_small': small.tobytes('jpeg', jpg_quality=70),
         })
+        # 每 10 页报一次：整段静默是"卡死感"的一半来源（另一半是看图阶段慢）
+        if on_log and ((i + 1) % 10 == 0 or i + 1 == n_total):
+            on_log(f'   已渲染 {i + 1}/{n_total} 页 · 已用 {time.time() - t_render:.0f} 秒')
     if on_log:
         total_kb = sum(len(p['img']) for p in pages) // 1024
         on_log(f'渲染完成：{len(pages)} 页，共 {total_kb} KB → pages/{gallery_sub}/')
@@ -783,7 +838,9 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
     def _ask(b64: str, style: str, tokens: int, think_off: bool, nudge: bool):
         from openai import OpenAI
         # max_retries=1：重试由外层统一负责，别让 SDK 再悄悄放大请求量
-        client = OpenAI(api_key=v['key'], base_url=v['base'] or None, timeout=90,
+        # timeout 90→70：一页真卡住时，90 秒 × 3 次重试 = 4.5 分钟没有任何输出，
+        # 用户会直接判定"卡死"。70 秒足够 Qwen/GLM 看完一页（实测 4~12 秒）。
+        client = OpenAI(api_key=v['key'], base_url=v['base'] or None, timeout=70,
                         max_retries=1)
         text = (SC.get('vision_prompt') or VISION_PROMPT).format(
             course=course, no=no, title=title or '（未提供）')
@@ -887,9 +944,46 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
     }
 
 
+def _page_cache_path(cache_dir, no: int) -> Path | None:
+    if not cache_dir:
+        return None
+    return Path(cache_dir) / f'p{int(no):03d}.json'
+
+
+def _page_cache_read(cache_dir, no: int) -> dict | None:
+    """逐页增量缓存：识别成功一页就落盘一页。
+
+    为什么必须逐页而不是整份：2026-11-11 用户「卡死了」那次，41 页跑完 ② 用了 8.4 分钟，
+    整份缓存只在 ② 全程结束后才写一次——中途关页面/刷新/服务重启，前面全白跑。
+    逐页落盘后，"再点一次"只补没成功的页，用户敢按 Stop 了。
+    """
+    p = _page_cache_path(cache_dir, no)
+    if not p or not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding='utf-8'))
+        if isinstance(d, dict) and d.get('no'):
+            return d
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _page_cache_write(cache_dir, page: dict) -> None:
+    p = _page_cache_path(cache_dir, page.get('no') or 0)
+    if not p:
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(page, ensure_ascii=False), encoding='utf-8')
+    except Exception:  # noqa: BLE001
+        pass          # 缓存写不进去不影响本次结果，只是下次不能省
+
+
 def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
                   on_progress=None, on_log=None, subject: str = 'math',
-                  rescue: bool = True) -> dict:
+                  rescue: bool = True, cache_dir=None,
+                  budget: float | None = None) -> dict:
     """
     并发逐页看图。任何一页失败都不许静默跳过——记进 failed 列表返回。
 
@@ -901,6 +995,17 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
     """
     results, failed = {}, []
     done = 0
+    total = len(pages)
+    t_all = time.time()
+    if budget is None:
+        try:
+            budget = float(cfg('STUDY_TOTAL_BUDGET', '1500') or 1500)
+        except Exception:  # noqa: BLE001
+            budget = 1500.0
+    # 总时间上限：到点主动停，把没跑的页明确列出来（配合逐页缓存可以直接续跑）。
+    # 默认 1500 秒（25 分钟）≈ 串行 100 页的量；设 0 = 不设上限。
+    deadline = (t_all + budget) if budget > 0 else None
+    cached_hits = 0
     # ！！！worker 线程里绝对不能碰 Streamlit ！！！
     # 2026-11-11 线上实录：37/41 页报 `NoSessionContext`（异常本身无说明），
     # 而单线程补跑全部能过。真因不是看图，是 app.py 的 on_log 会写 st 容器
@@ -908,33 +1013,76 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
     # 一写就抛 NoSessionContext —— 那一页的失败原因被"日志回调"顶掉了。
     # 所以：worker 只往自己的缓冲里写，主线程在 as_completed 里统一 flush。
     bufs: dict = {}
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futs = {}
+    submitted: list = []
+
+    def _beat(no: int, ok: bool) -> None:
+        """每页一行心跳：让用户看出「在动」以及「还要多久」。"""
+        if not on_log or not done:
+            return
+        el = time.time() - t_all
+        eta = el / done * max(total - done, 0)
+        on_log(f'  [{done}/{total}] 第 {no} 页 {"✔" if ok else "✘"}'
+               f' · 已用 {el:.0f} 秒 · 预计还需 {eta / 60:.1f} 分')
+
+    ex = ThreadPoolExecutor(max_workers=max(1, workers))
+    futs = {}
+    try:
         for p in pages:
+            c = _page_cache_read(cache_dir, p['no'])
+            if c is not None:                       # 上次已经认出来的页，直接复用
+                results[p['no']] = c
+                cached_hits += 1
+                done += 1
+                if on_progress:
+                    on_progress(done, total, p['no'])
+                continue
             buf: list = []
             bufs[p['no']] = buf
             sink = (lambda s, _b=buf: _b.append(s)) if on_log else None
             # 串行时按配额节流：不加间隔的话，1 并发也会连续打满 RPM
             if workers <= 1:
                 time.sleep(page_gap())
+            submitted.append(p['no'])
             # 主并发的限流退避短一些（真等交给单线程补跑），免得 41 页各睡 20 秒
             futs[ex.submit(lambda _p=p, _s=sink: profile_one(
                 _p, course, str(_p['no']), title, _s, subject,
                 rate_waits=(0, 4, 8)))] = p['no']
+        if cached_hits and on_log:
+            on_log(f'  复用上次已识别的 {cached_hits} 页，本次只需看 {total - cached_hits} 页')
+        cut_by_budget = False
         for fut in as_completed(futs):
+            if deadline and time.time() > deadline:
+                cut_by_budget = True
+                for f2 in futs:
+                    f2.cancel()                      # 还没开始的全撤，别无限挂着
+                break
             no = futs[fut]
             if on_log:
                 for s in bufs.get(no, []):
                     on_log(s)                       # 主线程写界面，安全
             try:
                 results[no] = fut.result()
+                _page_cache_write(cache_dir, results[no])
             except Exception as e:  # noqa: BLE001
                 failed.append({'page': no, 'error': err_text(e)})
                 if on_log:
                     on_log(f'第 {no} 页看图失败：{err_text(e, 120)}')
             done += 1
             if on_progress:
-                on_progress(done, len(pages), no)
+                on_progress(done, total, no)
+            _beat(no, no in results)
+    finally:
+        ex.shutdown(wait=False)     # 超时/异常都不许卡在"等所有线程"上
+    if cut_by_budget:
+        left = [n for n in submitted if n not in results
+                and not any(f['page'] == n for f in failed)]
+        for n in left:
+            failed.append({'page': n,
+                           'error': f'超过总时间上限（{budget:.0f} 秒）未处理；'
+                                    f'已识别的页已存好，再点一次只补这些页'})
+        if on_log:
+            on_log(f'  ⚠ 到了总时间上限（{budget:.0f} 秒），还有 {len(left)} 页没处理就停了。'
+                   f'已识别的 {len(results)} 页不会白跑，再点一次只补这 {len(left)} 页。')
 
     def _rescue(f: dict) -> bool:
         """
@@ -957,6 +1105,7 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
                 results[no] = profile_one(page, course, str(no), title, on_log,
                                           subject, mode=mode, model=model,
                                           rate_waits=(0, 12, 24))
+                _page_cache_write(cache_dir, results[no])
                 if on_log:
                     on_log(f'  第 {no} 页补跑成功（{tag}）')
                 return True
@@ -993,6 +1142,11 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
             failed = [] if first_ok else [ordered[0]]
             skipped = 0
             for f in rest:
+                if deadline and time.time() > deadline:
+                    skipped += 1
+                    f['error'] = (f.get('error', '') + ' → 超过总时间上限，未重试')[:400]
+                    failed.append(f)
+                    continue
                 if time.time() - t_rescue > budget:
                     skipped += 1
                     f['error'] = (f.get('error', '') + ' → 超过补跑时间上限，未重试')[:400]
@@ -1868,6 +2022,12 @@ def _cache_path(pdf_bytes: bytes, subject: str = 'math') -> Path:
     return d / (hashlib.sha256(pdf_bytes).hexdigest()[:16] + tail + f'-v{CACHE_VER}.json')
 
 
+def _page_cache_dir(pdf_bytes: bytes, subject: str = 'math') -> Path:
+    """逐页缓存的目录（和整份缓存在同一处，名字加 -pages）。"""
+    base = _cache_path(pdf_bytes, subject)
+    return base.parent / (base.stem + '-pages')
+
+
 def selfcheck(pdf_bytes: bytes, subject: str = 'math', course: str = '自检') -> dict:
     """
     只把 PDF 的第 1 页发给看图模型，验证「通道通不通」。
@@ -1934,9 +2094,14 @@ def run(pdf_bytes: bytes, lesson_key: str, title: str, no: str, course: str,
             pages = None
 
     if pages is None:
-        log(f'② 逐页看图理解（{ing["count"]} 页，{workers} 并发）…')
+        _fast, _slow = estimate_minutes(ing['count'], workers)
+        log(f'② 逐页看图理解（{ing["count"]} 页，{workers} 并发，'
+            f'按实测约需 {_fast:.0f}~{_slow:.0f} 分钟）…')
+        log('   每页一行心跳；中途 Stop 或关页面也不要紧，已认出的页已经存好，'
+            '再点一次只补没认出的页。')
         pf = profile_pages(ing['pages'], course, title=title, workers=workers,
-                           on_progress=on_progress, on_log=log, subject=subject)
+                           on_progress=on_progress, on_log=log, subject=subject,
+                           cache_dir=_page_cache_dir(pdf_bytes, subject))
         pages, failed = pf['pages'], pf['failed']
         # 识别率太低就地停下来说清楚，不许拿半份骨架去跑断言、
         # 最后给用户一句「断言没过，再点一次多数就好」——那是把接口故障说成手气问题。

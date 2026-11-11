@@ -215,9 +215,10 @@ HAS_SHEET_CROP = not _MISSING_SCAN and not _STALE_MODS
 _NOTES_NEED = ('ready', 'token_status', 'generate', 'list_lessons', 'load_lesson',
                'page_image', 'render_lesson', 'lesson_key_for', 'gallery_sub_for',
                'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int',
-               'selfcheck', 'vision_status')
-_NOTES_WANT = 6     # 要求 notes.MODULE_VER >= 6（bump 它 = 逼 app 重新加载 notes→notes_forge）
-# v6 = 带上 notes_forge v5：worker 线程不碰 st、429 真退避、截断 JSON 抢救、智谱系串行节流
+               'selfcheck', 'vision_status', 'pdf_info')
+_NOTES_WANT = 7     # 要求 notes.MODULE_VER >= 7（bump 它 = 逼 app 重新加载 notes→notes_forge）
+# v7 = 带上 notes_forge v6：上传即算页数与预计时长、渲染进度、逐页心跳、
+#      逐页增量缓存（Stop/关页面后重跑只补没认出的页）、总时间上限 1500 秒
 
 
 def _notes_missing():
@@ -2273,8 +2274,21 @@ elif page == '🗒️ 笔记工坊':
         title = st.text_input('这一讲的标题（照老师 PPT 封面填）', key='nt_title',
                               placeholder='例：名著专题：《水浒传》必考考点')
         up = st.file_uploader('课堂笔记 PDF', type=['pdf'], key='nt_pdf')
-        st.caption('一讲 50~60 页约需 4~8 分钟（逐页看图）。期间别关页面；'
-                   '生成完自动存档，断言不过就不会写进仓库（宁可不出，不出错的）。')
+        # 选好文件就先告诉他「几页、要多久」——2026-11-11「卡死了」那次，用户对着
+        # 一个不知道还剩多久的页面等了十几分钟，没法判断是在跑还是死了。
+        _info = None
+        if up:
+            try:
+                _info = notes.pdf_info(up.getvalue())
+            except Exception as _e:  # noqa: BLE001
+                st.caption(f'（这份 PDF 的页数暂时读不出来：{type(_e).__name__}；不影响生成）')
+        if _info:
+            st.caption(f"这份 PDF **{_info['pages']} 页**（{_info['size_kb']} KB）；按当前 "
+                       f"{_info['workers']} 并发实测速度，预计 **{_info['fast_min']:.0f}~"
+                       f"{_info['slow_min']:.0f} 分钟**。页数多就慢，这是看图本身的成本。")
+        st.caption('进度是**每页一行**（页码 + 已用时间 + 预计还需），看得出在动。'
+                   '中途点 Stop 或关页面都不要紧：已认出的页已经存好，再点一次只补没认出的页。'
+                   '生成完自动存档；断言不过不写进仓库（宁可不出，不出错的）。')
 
         # 看图通道自检：先花 1 次调用探一页，比等 41 页全跑完再报错划算得多。
         _vs = notes.vision_status()
@@ -2324,9 +2338,14 @@ elif page == '🗒️ 笔记工坊':
                             return
                         _logc.write(s)
 
+                    _t_click = time.time()
+
                     def _pr(done, total, pno):
+                        _el = time.time() - _t_click
+                        _eta = _el / done * max(total - done, 0) if done else 0
                         _prog.progress(min(done / max(total, 1), 1.0),
-                                       text=f'逐页识别 {done}/{total}（第 {pno} 页完成）')
+                                       text=f'逐页识别 {done}/{total} · 已用 {_el / 60:.1f} 分 · '
+                                            f'预计还需 {_eta / 60:.1f} 分')
 
                     try:
                         _res = notes.generate(up.read(), _code, int(no),
@@ -2334,6 +2353,8 @@ elif page == '🗒️ 笔记工坊':
                     except Exception as e:  # noqa: BLE001
                         _res = None
                         st.error(f'中断：{type(e).__name__}: {e}')
+                        st.caption('已经认出来的页都存好了（逐页缓存）——再点一次只补剩下的页，'
+                                   '不会从零开始，也不会重复花那份钱。')
                         if '看图通道' in str(e):
                             st.info('是**看图接口**的问题，不是这份 PDF、也不是你的操作。'
                                     '先点上面那个「🔍 先测看图通道」，把那一行的报错发我；'

@@ -473,4 +473,91 @@ ok('rate_waits=(0, 4, 8)' in _src_f and 'rate_waits=(0, 12, 24)' in _src_f,
    '主并发/补跑各用一档退避（4/8 秒 vs 12/24 秒）')
 ok("STUDY_RESCUE_BUDGET', '420'" in _src_f, '补跑预算默认 420 秒（240 秒实测只够补 8 页）')
 
+# ---------------------------------------------------------------
+# 7.5 2026-11-11 晚：用户报「卡死了」→ 慢必须看得见、能停、能续
+# ---------------------------------------------------------------
+import pymupdf as _fitz
+import tempfile as _tf
+import pathlib as _pl
+import time as _tm
+
+
+def _mk_pdf(n):
+    d = _fitz.open()
+    for i in range(n):
+        p = d.new_page()
+        p.insert_text((72, 72), f'page {i + 1}')
+    b = d.tobytes()
+    d.close()
+    return b
+
+
+_pdf3 = _mk_pdf(3)
+ok(F.pdf_pages(_pdf3) == 3, f'只数页数不渲染（3 页 PDF → {F.pdf_pages(_pdf3)} 页）')
+_i3 = F.pdf_info(_pdf3)
+ok(_i3['pages'] == 3 and _i3['fast_min'] > 0 and _i3['slow_min'] >= _i3['fast_min'],
+   f"pdf_info 给得出页数与预计时长：{_i3['pages']} 页 / "
+   f"{_i3['fast_min']}~{_i3['slow_min']} 分钟（{_i3['workers']} 并发）")
+ok(F.estimate_minutes(60)[0] > F.estimate_minutes(41)[0],
+   '页数越多预计时间越长（60 页 > 41 页），不写死一个数')
+
+# 逐页增量缓存：第二次跑不该再调模型
+_cd = _pl.Path(_tf.mkdtemp(prefix='pgcache_')) / 'pages'
+_calls2 = []
+
+
+def _fake_ok(page, course, no, title='', on_log=None, subject='math',
+             mode='small', model=None, rate_waits=None):
+    _calls2.append(int(no))
+    return {'no': int(no), 'role': 'content', 'belongs': 'this', 'topic': 't',
+            'examples': [], 'points': ['a'], 'handwriting': False, 'page_text': ''}
+
+
+_orig_one = F.profile_one
+os.environ['STUDY_VISION_GAP'] = '0'
+F.profile_one = _fake_ok
+try:
+    _pages3 = [{'no': i + 1, 'text': '', 'img': b'x', 'img_small': b'x'} for i in range(3)]
+    r1 = F.profile_pages(_pages3, '数学', workers=1, cache_dir=_cd)
+    n_first = len(_calls2)
+    r2 = F.profile_pages(_pages3, '数学', workers=1, cache_dir=_cd)
+    n_second = len(_calls2) - n_first
+    ok(len(r1['pages']) == 3 and not r1['failed'], f'首次跑 3 页成功（调用 {n_first} 次）')
+    ok(n_second == 0 and len(r2['pages']) == 3,
+       f'第二次直接复用逐页缓存，0 次调用（省的是真钱）：调用 {n_second} 次')
+finally:
+    F.profile_one = _orig_one
+
+# 总时间上限：到点主动停，并明确列出没处理的页
+_cd2 = _pl.Path(_tf.mkdtemp(prefix='pgcache2_')) / 'pages'
+_calls3 = []
+
+
+def _slow(page, course, no, title='', on_log=None, subject='math',
+          mode='small', model=None, rate_waits=None):
+    _tm.sleep(0.25)
+    _calls3.append(int(no))
+    return {'no': int(no), 'role': 'content', 'belongs': 'this', 'topic': 't',
+            'examples': [], 'points': [], 'handwriting': False, 'page_text': ''}
+
+
+F.profile_one = _slow
+try:
+    _pages5 = [{'no': i + 1, 'text': '', 'img': b'x', 'img_small': b'x'} for i in range(5)]
+    r3 = F.profile_pages(_pages5, '数学', workers=1, cache_dir=_cd2, budget=0.4)
+    _bud = [f for f in r3['failed'] if '超过总时间上限' in f['error']]
+    ok(len(r3['pages']) >= 1 and _bud,
+       f'总时间上限到点主动停：认出 {len(r3["pages"])} 页，{len(_bud)} 页标「超过总时间上限」')
+    ok(0 < len(r3['pages']) < 5,
+       f'不是全跑完才停（{len(r3["pages"])}/5），说明上限真的生效')
+finally:
+    F.profile_one = _orig_one
+
+_src_app = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app.py'),
+                encoding='utf-8').read()
+ok('notes.pdf_info(' in _src_app and '预计还需' in _src_app,
+   '界面上传即显示页数/预计时长，进度条带「预计还需」')
+ok("STUDY_TOTAL_BUDGET', '1500'" in _src_f, '总时间上限默认 1500 秒（可配，0=不限）')
+ok("timeout=70" in _src_f, '单页超时 70 秒（90 秒 × 3 次会让页面静默 4.5 分钟）')
+
 print(f'\nALL NOTES CHECKS OK ({PASS} 项)')
