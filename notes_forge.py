@@ -40,7 +40,7 @@ except Exception:
 # 2026-11-11 踩过的坑：notes.py 自己 reload 了，notes_forge 没人 reload，
 # 新按钮点下去报「module 'notes_forge' has no attribute 'selfcheck'」——
 # 名单式守卫又漏一项。所以这里给版本号，由 notes._forge() 负责比对 + reload。
-MODULE_VER = 2
+MODULE_VER = 3
 
 # ============================================================
 # 配置（与 llm.py 同一套键：STUDY_LLM_* / STUDY_VISION_*，
@@ -79,8 +79,10 @@ def vision_cfg() -> dict:
         'key': cfg('STUDY_VISION_API_KEY'),
         'base': cfg('STUDY_VISION_BASE_URL', 'https://api.siliconflow.cn/v1'),
         'model': cfg('STUDY_VISION_MODEL', 'Qwen/Qwen3-VL-32B-Instruct'),
-        # 主模型返回空内容/不认图时的替补（补跑阶段才会用到，正常不花钱）
-        'fallback': cfg('STUDY_VISION_FALLBACK_MODEL', 'Qwen/Qwen3-VL-8B-Instruct'),
+        # 主模型返回空内容/不认图时的替补（补跑阶段才用）。
+        # **必须留空默认值**：2026-11-11 线上实测，把 Qwen3-VL 的名字发到智谱的 base 上
+        # 只会 400（模型不存在），不但救不了页，还每页多花一次往返。
+        'fallback': cfg('STUDY_VISION_FALLBACK_MODEL', ''),
     }
 
 
@@ -91,10 +93,13 @@ def default_workers() -> int:
     4 路慢不了多少（41 页约多花 20 秒），但失败面小很多。
     嫌慢可以在 secrets 里设 STUDY_VISION_WORKERS（1~8）自己调，不用改代码。
     """
+    base = (vision_cfg().get('base') or '').lower()
+    # 智谱 flash 的并发门限明显更紧（线上 4 路时大面积失败 → 补跑也救不回来）
+    hard = 2 if ('bigmodel' in base or 'zhipu' in base) else 4
     try:
-        n = int(cfg('STUDY_VISION_WORKERS', '4') or 4)
+        n = int(cfg('STUDY_VISION_WORKERS', str(hard)) or hard)
     except Exception:  # noqa: BLE001
-        n = 4
+        n = hard
     return max(1, min(8, n))
 
 
@@ -683,7 +688,7 @@ def profile_one(page: dict, course: str, no: str, title: str = '', on_log=None,
     def _ask(b64: str, style: str, tokens: int, think_off: bool, nudge: bool):
         from openai import OpenAI
         # max_retries=1：重试由外层统一负责，别让 SDK 再悄悄放大请求量
-        client = OpenAI(api_key=v['key'], base_url=v['base'] or None, timeout=180,
+        client = OpenAI(api_key=v['key'], base_url=v['base'] or None, timeout=90,
                         max_retries=1)
         text = (SC.get('vision_prompt') or VISION_PROMPT).format(
             course=course, no=no, title=title or '（未提供）')
@@ -841,6 +846,8 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
         if on_log:
             on_log(f'  补跑（单线程，换小图重试；'
                    f'{"大面积失败，先探一页看接口通不通" if probe_only else f"共 {len(ordered)} 页"}）…')
+        budget = float(cfg('STUDY_RESCUE_BUDGET', '240') or 240)
+        t_rescue = time.time()
         first_ok = _rescue(ordered[0])
         if probe_only and not first_ok:
             if on_log:
@@ -849,8 +856,20 @@ def profile_pages(pages: list, course: str, title: str = '', workers: int = 6,
         else:
             rest = ordered[1:]
             if probe_only and on_log:
-                on_log(f'  单线程能通 → 剩下的 {len(rest)} 页接着补…')
-            failed = [f for f in rest if not _rescue(f)]
+                on_log(f'  单线程能通 → 剩下的 {len(rest)} 页接着补（上限 {budget:.0f} 秒）…')
+            # 第一页（探路那一页）若也没救回来，必须算进失败清单，不能因为"已经试过"就吞掉
+            failed = [] if first_ok else [ordered[0]]
+            skipped = 0
+            for f in rest:
+                if time.time() - t_rescue > budget:
+                    skipped += 1
+                    f['error'] = (f.get('error', '') + ' → 超过补跑时间上限，未重试')[:400]
+                    failed.append(f)
+                    continue
+                if not _rescue(f):
+                    failed.append(f)
+            if skipped and on_log:
+                on_log(f'  ⚠ 有 {skipped} 页超过补跑时间上限（{budget:.0f}s），未重试，已记进失败页')
             if on_log and failed:
                 on_log(f'  仍有 {len(failed)} 页没识别出来')
     elif rescue:

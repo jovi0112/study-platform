@@ -215,7 +215,7 @@ _NOTES_NEED = ('ready', 'token_status', 'generate', 'list_lessons', 'load_lesson
                'page_image', 'render_lesson', 'lesson_key_for', 'gallery_sub_for',
                'SUBJECT_LABEL', 'REPO', 'MODULE_VER', 'no_int',
                'selfcheck', 'vision_status')
-_NOTES_WANT = 3     # 要求 notes.MODULE_VER >= 3（v3 会连带 reload notes_forge）
+_NOTES_WANT = 4     # 要求 notes.MODULE_VER >= 4（bump 它 = 逼 app 重新加载 notes→notes_forge）
 
 
 def _notes_missing():

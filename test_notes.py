@@ -302,6 +302,40 @@ finally:
     _openai.OpenAI = _real_openai
     os.environ.pop('STUDY_VISION_BASE_URL', None)
 
+# 5.7 并发按服务商定；补跑有总时长上限；探路页不许被吞
+os.environ['STUDY_VISION_BASE_URL'] = 'https://open.bigmodel.cn/api/paas/v4'
+ok(F.default_workers() == 2, f'智谱地址默认 2 并发（flash 门限紧）: {F.default_workers()}')
+os.environ['STUDY_VISION_BASE_URL'] = 'https://api.siliconflow.cn/v1'
+ok(F.default_workers() == 4, f'其它厂商默认 4 并发: {F.default_workers()}')
+os.environ['STUDY_VISION_WORKERS'] = '3'
+ok(F.default_workers() == 3, 'STUDY_VISION_WORKERS 可覆盖')
+os.environ.pop('STUDY_VISION_WORKERS', None)
+os.environ.pop('STUDY_VISION_BASE_URL', None)
+
+calls.clear()
+
+
+def _bad_first(page, course, no, title='', on_log=None, subject='math',
+               mode='small', model=None):
+    calls.append((int(no), mode))
+    if int(no) <= 7:
+        raise TimeoutError()
+    return {'no': int(no), 'role': 'content', 'belongs': 'this', 'topic': 't',
+            'examples': [], 'points': [], 'handwriting': False, 'page_text': ''}
+
+
+F.profile_one = _bad_first
+os.environ['STUDY_RESCUE_BUDGET'] = '0'      # 预算为 0：第一页试完就不再补
+try:
+    pg = [{'no': i, 'img': b'x', 'img_small': b'y', 'text': ''} for i in range(1, 11)]
+    out3 = F.profile_pages(pg, '课', title='t', workers=4)
+finally:
+    F.profile_one = _real_po
+    os.environ.pop('STUDY_RESCUE_BUDGET', None)
+ok(len(out3['failed']) == 7, f'7/10 失败时失败清单完整（探路页也在内）: {len(out3["failed"])}')
+ok(all('超过补跑时间上限' in f['error'] or 'TimeoutError' in f['error'] for f in out3['failed']),
+   '超预算的页带明确说明，不静默')
+
 # ============ 7. 结构断言：app.py 的 notes.xxx 调用 ⊆ 守卫名单 ============
 # 名单式自检天生会漏（scan 的 box_ratio 实测漏过），所以用源码扫描兜底：
 # 只要 app.py 里调了名单外的 notes 函数，这里立刻红。
